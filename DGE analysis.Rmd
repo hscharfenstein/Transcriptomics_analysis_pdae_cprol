@@ -5,26 +5,243 @@ date: "`r Sys.Date()`"
 output: html_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+
+```{r}
+library(tidyverse)
+library(DESeq2)
+library(pheatmap)
+library(RColorBrewer)
+library(readxl)
 ```
 
-## R Markdown
+1. Host expression
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+Loading data
+```{r}
+#Import metadata
+metadata <- read_xlsx("/Users/hugo/Documents/Melbourne PhD/Experimental work/Chapter 5/Gene counts matrices/rnaseq_metadata.xlsx", sheet = 1)
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+#Import gene annotations for the C. proliferum reference genome
 
-```{r cars}
-summary(cars)
+
+#Import the gene count matrix resulting from the mapping of sequences to the C. proliferum reference genome
+host_counts <- read_tsv("/Users/hugo/Documents/Melbourne PhD/Experimental work/Chapter 5/Gene counts matrices/gene_counts_matrix_pdae.txt")
 ```
 
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+Collate data to gene level
+```{r}
+host_gene_counts <- host_counts %>% 
+  separate(gene_id, c("gene", "exon"), sep = "\\.exon") %>% 
+  group_by(gene) %>% 
+  summarise_if(is.numeric, sum)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+Decide on appropriate statistical model for downstream analysis 
+```{r}
+#Visualise RNA-seq count distribution for one sample
+ggplot(host_gene_counts) +
+  geom_histogram(aes(x = Amb_C_I_1005_S22_), stat = "bin", bins = 200) +
+  xlim(-5, 500) +
+  xlab("Raw expression counts") +
+  ylab("Number of genes")
+
+#Calculate mean and variance of count data
+mean_counts <- apply(host_gene_counts[, 3:5], 1, mean)
+variance_counts <- apply(host_gene_counts[, 3:5], 1, var)
+df <- data.frame(mean_counts, variance_counts)
+
+#Plot mean versus variance
+ggplot(df) +
+        geom_point(aes(x=mean_counts, y=variance_counts)) + 
+        geom_line(aes(x=mean_counts, y=mean_counts, color="red")) +
+        scale_y_log10() +
+        scale_x_log10()
+#Overall, the variance appears to be greater than mean of counts
+#This rules out use of Poisson distribution where mean=variance
+#Rather, a negative binomial model is more appropriate to this analysis (in this case DESeq2 will be used)
+```
+
+Load raw gene counts into DESeq objects
+```{r}
+#Modify the metadata table, adding  sample names as row names (needed for some of the DESeq functions)
+metadata <- as.data.frame(metadata)
+rownames(metadata) <- metadata$SampleName
+
+#Modify the host_gene_counts table, adding  gene ids as row names (needed for some of the DESeq functions)
+host_gene_counts <- as.data.frame(host_gene_counts)
+rownames(host_gene_counts) <- host_gene_counts$gene
+host_gene_counts <- host_gene_counts[,-1]
+
+#Check if row and column names match between metadata and sym_gene_counts
+all(colnames(host_gene_counts) %in% rownames(metadata)) 
+all(colnames(host_gene_counts) == rownames(metadata))
+
+#Load the gene count matrix from STAR into an DESeq object
+host_dds <- DESeqDataSetFromMatrix(countData = host_gene_counts,
+                                   colData = metadata,
+                                   design = ~ Temperature + RI_treatment)
+```
+
+Normalisation of gene counts
+```{r}
+#Perform the median of ratios method of normalization
+host_dds <- estimateSizeFactors(host_dds)
+
+#Inspect the normalization factor applied to each sample
+sizeFactors(host_dds)
+
+#Retrieve normalized counts matrix from sym_dds
+norm_host_counts <- counts(host_dds, normalized=TRUE)
+
+#Save normalized counts to a file for later visualisation
+write.table(norm_host_counts, file="/Users/hugo/Documents/Melbourne PhD/Experimental work/Chapter 5/Gene counts matrices/normalized_host_gene_counts.txt", sep="\t", quote=F, col.names=NA)
+```
+
+QC and exploratory analysis of dataset
+```{r}
+#Transform counts for data visualization
+host_rld <- vst(host_dds, blind=TRUE)
+
+#Plot PCA 
+host_PCA <- plotPCA(host_rld, intgroup=c("RI_treatment", "Temperature"), returnData=TRUE)
+percentVar <- round(100 * attr(host_PCA, "percentVar"))
+host_PCA_plot <- ggplot(host_PCA, aes(PC1, PC2, color = RI_treatment, shape = Temperature)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance"))
+host_PCA_plot
+
+#Plot heatmap
+host_rld_mat <- assay(host_rld) #Extract the rlog matrix from the object
+host_rld_cor <- cor(host_rld_mat) #Compute pairwise correlation values
+pheatmap(host_rld_cor)
+```
+
+DE analysis
+```{r}
+host_deseq <- DESeq(host_dds)
+
+#Estimation of size factors
+sizeFactors(host_deseq) #Check the size factors
+colSums(counts(host_deseq)) #Total number of raw counts per sample
+colSums(counts(host_deseq, normalized=T)) #Total number of normalized counts per sample
+
+#Fit curve to gene-wise dispersion estimates
+plotDispEsts(host_deseq) #Plot dispersion estimates (should expect data to generally scatter around the curve, with the dispersion decreasing with increasing mean expression levels)
+```
+
+2. Symbiont expression
+
+Loading data
+```{r}
+#Import metadata
+metadata <- read_xlsx("/Users/hugo/Documents/Melbourne PhD/Experimental work/Chapter 5/Gene counts matrices/rnaseq_metadata.xlsx", sheet = 1)
+
+#Import gene annotations for the C. proliferum reference genome
+
+
+#Import the gene count matrix resulting from the mapping of sequences to the C. proliferum reference genome
+sym_counts <- read_tsv("/Users/hugo/Documents/Melbourne PhD/Experimental work/Chapter 5/Gene counts matrices/gene_counts_matrix_cprol.txt")
+```
+
+Collate data to gene level
+```{r}
+sym_gene_counts <- sym_counts %>% 
+  separate(gene_id, c("gene", "exon"), sep = "\\.exon") %>% 
+  group_by(gene) %>% 
+  summarise_if(is.numeric, sum)
+```
+
+Decide on appropriate statistical model for downstream analysis 
+```{r}
+#Visualise RNA-seq count distribution for one sample
+ggplot(sym_gene_counts) +
+  geom_histogram(aes(x = Amb_C_I_1005_S22_), stat = "bin", bins = 200) +
+  xlim(-5, 500) +
+  xlab("Raw expression counts") +
+  ylab("Number of genes")
+
+#Calculate mean and variance of count data
+sym_mean_counts <- apply(sym_gene_counts[, 3:5], 1, mean)
+sym_variance_counts <- apply(sym_gene_counts[, 3:5], 1, var)
+sym_mean_var_df <- data.frame(sym_mean_counts, sym_variance_counts)
+
+#Plot mean versus variance
+ggplot(sym_mean_var_df) +
+        geom_point(aes(x=sym_mean_counts, y=sym_variance_counts)) + 
+        geom_line(aes(x=sym_mean_counts, y=sym_mean_counts, color="red")) +
+        scale_y_log10() +
+        scale_x_log10()
+#Overall, the variance appears to be greater than mean of counts
+#This rules out use of Poisson distribution where mean=variance
+#Rather, a negative binomial model is more appropriate to this analysis (in this case DESeq2 will be used)
+```
+
+Load raw gene counts into DESeq objects
+```{r}
+#Modify the metadata table, adding  sample names as row names (needed for some of the DESeq functions)
+metadata <- as.data.frame(metadata)
+rownames(metadata) <- metadata$SampleName
+
+#Modify the sym_gene_counts table, adding  gene ids as row names (needed for some of the DESeq functions)
+sym_gene_counts <- as.data.frame(sym_gene_counts)
+rownames(sym_gene_counts) <- sym_gene_counts$gene
+sym_gene_counts <- sym_gene_counts[,-1]
+
+#Check if row and column names match between metadata and sym_gene_counts
+all(colnames(sym_gene_counts) %in% rownames(metadata)) 
+all(colnames(sym_gene_counts) == rownames(metadata))
+
+#Load the gene count matrix from STAR into an DESeq object
+sym_dds <- DESeqDataSetFromMatrix(countData = sym_gene_counts,
+                                  colData = metadata,
+                                  design = ~ Temperature + RI_treatment)
+```
+
+Normalisation of gene counts
+```{r}
+#Perform the median of ratios method of normalization
+sym_dds <- estimateSizeFactors(sym_dds)
+
+#Inspect the normalization factor applied to each sample
+sizeFactors(sym_dds)
+
+#Retrieve normalized counts matrix from sym_dds
+norm_sym_counts <- counts(sym_dds, normalized=TRUE)
+
+#Save normalized counts to a file for later visualisation
+write.table(norm_sym_counts, file="/Users/hugo/Documents/Melbourne PhD/Experimental work/Chapter 5/Gene counts matrices/normalized_sym_gene_counts.txt", sep="\t", quote=F, col.names=NA)
+```
+
+QC and exploratory analysis of dataset
+```{r}
+#Transform counts for data visualization
+sym_rld <- vst(sym_dds, blind=TRUE)
+
+#Plot PCA 
+sym_PCA <- plotPCA(sym_rld, intgroup=c("RI_treatment", "Temperature"), returnData=TRUE)
+percentVar <- round(100 * attr(sym_PCA, "percentVar"))
+sym_PCA_plot <- ggplot(sym_PCA, aes(PC1, PC2, color = RI_treatment, shape = Temperature)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance"))
+sym_PCA_plot
+
+#Plot heatmap
+sym_rld_mat <- assay(sym_rld) #Extract the rlog matrix from the object
+sym_rld_cor <- cor(sym_rld_mat) #Compute pairwise correlation values
+pheatmap(sym_rld_cor)
+```
+
+DE analysis
+```{r}
+sym_deseq <- DESeq(sym_dds)
+
+#Estimation of size factors
+sizeFactors(sym_deseq) #Check the size factors
+colSums(counts(sym_deseq)) #Total number of raw counts per sample
+colSums(counts(sym_deseq, normalized=T)) #Total number of normalized counts per sample
+
+#Fit curve to gene-wise dispersion estimates
+plotDispEsts(sym_deseq) #Plot dispersion estimates (should expect data to generally scatter around the curve, with the dispersion decreasing with increasing mean expression levels)
+```
