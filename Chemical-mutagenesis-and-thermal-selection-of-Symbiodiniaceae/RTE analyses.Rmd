@@ -1,0 +1,1053 @@
+---
+title: "RTE analyses"
+author: "Hugo Scharfenstein"
+date: "2022-10-14"
+output: html_document
+---
+Load packages
+```{r}
+#Data import and export packages
+library(readxl)
+library(writexl)
+#Data wrangling packages
+library(tidyverse)
+#Other packages
+library(ggpattern)
+library(gplots)
+library(growthrates)
+library(emmeans)
+library(DHARMa)
+library(ggradar)
+```
+
+# Import data
+```{r}
+RTE.df <- read_xlsx("./RTE data.xlsx", sheet = 1) %>% filter(Strain != 'SS')
+
+#Prepare labels for facets
+treatment.labs <- c("Ambient temperature", "Elevated temperature")
+names(treatment.labs) <- c("Ambient", "Elevated")
+
+#Relevel Timepoint and Strain orders
+RTE.df$Timepoint <- ordered(RTE.df$Timepoint, levels = c("t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10"))
+RTE.df$Strain <- ordered(RTE.df$Strain, levels = c("WT", "MT"))
+
+#Make nutrient uptake rates absolute
+RTE.df <- mutate(RTE.df, NuNO3 = abs(NuNO3))
+RTE.df <- mutate(RTE.df, NuPO4 = abs(NuPO4))
+
+#Create experimental phase column
+RTE.df <- mutate(RTE.df, ExpPhase = case_when(str_detect(Timepoint, "t1|t2|t3") ~ "Early",
+                                              str_detect(Timepoint, "t4|t5|t6") ~ "Mid",
+                                              str_detect(Timepoint,"t7|t8|t9|t10") ~ "Late")) %>%
+  relocate(ExpPhase, .after = Timepoint) 
+```
+
+# Prepare data
+
+## Calculate mean cell density
+```{r}
+#Calculate mean, sd and se CellD for each timepoint
+CellD.df <- RTE.df %>%
+  dplyr::select(Species, Treatment, Strain, ExpPhase, Day, Timepoint, Replicate, CellD) %>%
+  group_by(Species, Treatment, Day, Strain) %>%
+  mutate(mean_CellD = mean(CellD)) %>%
+  mutate(sd_CellD = sd(CellD)) %>%
+  mutate(se_CellD = sd(CellD)/sqrt(length(CellD))) %>%
+  ungroup()
+```
+
+## Calculate the maximum growth rates
+```{r}
+#Split CellD.df into multiple dfs (only one treatment at a time can be analysed by growthrates::fit_easylinear)
+splitted_CellD.df <- multisplit(subset(CellD.df, Species == "F. kawagutii" & Replicate == 1), # Change species and replicate
+                                c("Species", "Treatment", "Strain", "Replicate"))
+sub_split_CellD.df <- splitted_CellD.df[[1]] # Change the number to switch to a different list (i.e., condition)
+
+#Linear model fitting using growthrates::fit_easylinear
+fit.df <- fit_easylinear(sub_split_CellD.df$Day, sub_split_CellD.df$CellD)
+summary(fit.df)
+coef(fit.df)  # Exponential growth parameters
+rsquared(fit.df)  # Coefficient of determination (of log-transformed data)
+deviance(fit.df)  # Residual sum of squares of log-transformed data
+
+#Visualise linear model fit and corresponding timepoints
+par(mfrow = c(1, 2))
+plot(fit.df, log = "y")
+plot(fit.df)
+
+#Record mumax value from 'coef(fit.df)' and repeat process for all replicates
+#mumax values are provided in 'RTE.df' to proceed with following analyses
+```
+
+## Calculate mean maximum growth rates (for each strain at each temperature)
+```{r}
+GrowthR.df <- RTE.df %>%
+  dplyr::select(Species, Treatment, Strain, Replicate, GrowthR) %>%
+  drop_na() %>%
+  group_by(Species, Treatment, Strain) %>%
+  mutate(mean_GrowthR = mean(GrowthR)) %>%
+  mutate(sd_GrowthR = sd(GrowthR)) %>%
+  mutate(se_GrowthR = sd(GrowthR)/sqrt(length(GrowthR))) %>%
+  ungroup()
+```
+
+## Prepare trait summary df
+```{r}
+RTE_trait_sum.df <- data.frame(Species_temp  = c("Durusdinium_Ambient", "Fugacium_Ambient", "Symbiodinium_Ambient",
+                                                 "Durusdinium_Elevated", "Fugacium_Elevated", "Symbiodinium_Elevated"),
+                               CellD = c(0, 0.5, 0.5, 0, 1, 1),
+                               GrowthR = c(0, 0.5, 0.5, 0, 0.5, 0.5),
+                               FvFm = c(0, 0.5, 0, 1, 1, 1),
+                               Qm = c(0, 1, 0, 1, 0, 1),
+                               InROS = c(0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
+                               ExROS = c(0.5, 0.5, 0.5, 0.5, 0.5, 1),
+                               NO3uptake = c(0.5, 0.5, 1, 0.5, 0.5, 0.5),
+                               PO4uptake = c(0.5, 0.5, 0.5, 0, 1, 0.5))
+```
+
+# Statistical analyses
+
+## Cell density - GLM with EMM
+```{r}
+CellD.df2 <- CellD.df %>%
+  dplyr::select(Species, Treatment, Strain, Day, Timepoint, ExpPhase, CellD) %>%
+  distinct()
+
+str(CellD.df2)
+CellD.df2$CellD <- as.numeric(CellD.df2$CellD)
+CellD.df2$Day <- as.factor(CellD.df2$Day)
+CellD.df2$Timepoint <- as.factor(CellD.df2$Timepoint)
+CellD.df2$Treatment <- as.factor(CellD.df2$Treatment)
+CellD.df2$Species <- as.factor(CellD.df2$Species)
+CellD.df2$Strain <- as.factor(CellD.df2$Strain)
+str(CellD.df2)
+
+#Fit CellD.df2 to a GLM - family Gamma
+CellD.glm <- glm(CellD ~ Strain * Treatment * Timepoint, data = subset(CellD.df2, Species == "S. pilosum"),
+                 family = Gamma(link = 'log')) 
+
+#Check model assumptions with DHARMa
+CellD.glm %>% simulateResiduals(plot = TRUE)
+par(mfrow = c(2, 2))
+plot(CellD.glm)
+
+#ANOVA for main interactions
+anova(CellD.glm, test="F")
+summary(CellD.glm)
+
+#EMMEANS - Strain contrast (by early, mid and late experimemtal phase)
+CellD.emmStr.1 = emmeans(CellD.glm, ~ Strain|Treatment, type = 'response',
+                         at = list(Timepoint = c('t1','t2','t3'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+CellD.emmStr.1
+
+CellD.emmStr.2 = emmeans(CellD.glm, ~ Strain|Treatment, type = 'response',
+                         at = list(Timepoint = c('t4','t5','t6'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+CellD.emmStr.2
+
+CellD.emmStr.3 = emmeans(CellD.glm, ~ Strain|Treatment, type = 'response',
+                         at = list(Timepoint = c('t7','t8','t9','t10'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+CellD.emmStr.3
+
+#EMMEANS - Temperature contrast
+CellD.emmTemp.1 = emmeans(CellD.glm, ~ Treatment|Strain, type = 'response',
+                          at = list(Timepoint = c('t1','t2','t3'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+CellD.emmTemp.1
+
+CellD.emmTemp.2 = emmeans(CellD.glm, ~ Treatment|Strain, type = 'response',
+                          at = list(Timepoint = c('t4','t5','t6'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+CellD.emmTemp.2
+
+CellD.emmTemp.3 = emmeans(CellD.glm, ~Treatment|Strain, type = 'response',
+                          at = list(Timepoint = c('t7','t8','t9', "t10"))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+CellD.emmTemp.3
+
+#Create dfs for each species containings EMMEANS of cell density over time
+CellD.glm.A <- glm(CellD ~ Strain * Treatment * Day, data = subset(CellD.df2, Species == "S. pilosum"), 
+                   family = Gamma(link = 'log'))
+
+CellD.emm.A = emmeans(CellD.glm.A, ~ Treatment|Day*Strain, type = 'response') %>%
+  as.data.frame() %>%
+  mutate(Species = "S. pilosum")
+
+CellD.glm.D <- glm(CellD ~ Strain * Treatment * Day, data = subset(CellD.df2, Species == "D. trenchii"), 
+                   family = Gamma(link = 'log'))
+
+CellD.emm.D = emmeans(CellD.glm.D, ~ Treatment|Day*Strain, type = 'response') %>%
+  as.data.frame() %>%
+  mutate(Species = "D. trenchii") 
+
+CellD.glm.F <- glm(CellD ~ Strain * Treatment * Day, data = subset(CellD.df2, Species == "F. kawagutii"),
+                   family = Gamma(link = 'log'))
+
+CellD.emm.F = emmeans(CellD.glm.F, ~ Treatment|Day*Strain, type = 'response') %>%
+  as.data.frame() %>%
+  mutate(Species = "F. kawagutii") 
+
+#Merge dfs
+CellD.emm <- merge(CellD.emm.A, CellD.emm.D,
+                   by = c("Species", "Treatment", "Strain", "response", "SE", "df", "lower.CL", "upper.CL"), 
+                   all = TRUE) %>%
+  merge(CellD.emm.F,
+        by = c("Species", "Treatment", "Strain", "response", "SE", "df", "lower.CL", "upper.CL"),
+        all = TRUE) %>%
+  mutate(Time = coalesce(Day.x,Day.y, Day)) %>%
+  select(!c("Day.x", "Day.y", "Day")) %>%
+  rename(Day = Time) %>%
+  mutate(Day = as.numeric(as.character(Day)))
+```
+
+##  Growth rates - GLM with EMM
+```{r}
+#Keep only relevant parameters from GrowthR.df
+GrowthR.df2 <- GrowthR.df %>%
+  dplyr::select(Species, Strain, Treatment, GrowthR) 
+
+#Check that all objects are factors (except GrowthR)
+str(GrowthR.df2)
+GrowthR.df2$GrowthR <- as.numeric(GrowthR.df2$GrowthR)
+GrowthR.df2$Treatment <- as.factor(GrowthR.df2$Treatment)
+GrowthR.df2$Species <- as.factor(GrowthR.df2$Species)
+GrowthR.df2$Strain <- as.factor(GrowthR.df2$Strain)
+str(GrowthR.df2)
+
+#Fit GrowthR.df2 to a GLM - family gaussian
+GrowthR.glm <- glm(GrowthR ~ Strain * Treatment, data = subset(GrowthR.df2, Species == "S. pilosum"), # Change df for each species
+                   family = gaussian(link = 'identity'))
+
+#Check model assumptions using DHARMa
+GrowthR.glm %>% simulateResiduals(plot = TRUE)
+par(mfrow = c(2, 2))
+plot(GrowthR.glm)
+
+#ANOVA for main interactions
+anova(GrowthR.glm, test="F")
+summary(GrowthR.glm)
+
+#EMMEANS - Strain contrast
+Growth.emmStr = emmeans(GrowthR.glm, ~ Strain|Treatment, type = 'response') %>%
+  pairs() %>%
+  summary(infer = TRUE)
+Growth.emmStr
+
+#EMMEANS - Temperature contrast
+Growth.emmTemp = emmeans(GrowthR.glm, ~ Treatment|Strain, type = 'response') %>%
+  pairs() %>%
+  summary(infer = TRUE)
+Growth.emmTemp
+```
+
+## Fv/Fm - GLM with EMM
+```{r}
+FvFm.df <- RTE.df %>%
+  dplyr::select(Species, Treatment, Strain, Day, Timepoint, ExpPhase, FvFm) %>%
+  drop_na()
+
+#Check that all objects are factors (Day/Timepoint should be kept as factor)
+str(FvFm.df)
+FvFm.df$FvFm <- as.numeric(FvFm.df$FvFm)
+FvFm.df$Day <- as.factor(FvFm.df$Day)
+FvFm.df$Timepoint <- as.factor(FvFm.df$Timepoint)
+FvFm.df$Treatment <- as.factor(FvFm.df$Treatment)
+FvFm.df$Species <- as.factor(FvFm.df$Species)
+FvFm.df$Strain <- as.factor(FvFm.df$Strain)
+str(FvFm.df)
+
+#Fit FvFmdf to a GLM - family quasibinomial
+FvFm.glm <- glm(FvFm ~ Strain * Treatment * Timepoint, data = subset(FvFm.df, Species == "S. pilosum"), #Change per species
+                family = quasibinomial(link = 'logit'))  
+
+#ANOVA for main interactions
+anova(FvFm.glm, test="F")
+summary(FvFm.glm)
+
+#EMMEANS - Strain contrast (by early, mid and late experimemtal phase)
+FvFm.emmStr.1 = emmeans(FvFm.glm, ~ Strain|Treatment, type = 'response', at = list(Timepoint = c('t1','t2','t3'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+FvFm.emmStr.1
+
+FvFm.emmStr.2 = emmeans(FvFm.glm, ~ Strain|Treatment, type = 'response', at = list(Timepoint = c('t4','t5','t6'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+FvFm.emmStr.2
+
+FvFm.emmStr.3 = emmeans(FvFm.glm, ~ Strain|Treatment, type = 'response', 
+                        at = list(Timepoint = c('t7','t8','t9','t10'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+FvFm.emmStr.3
+
+#EMMEANS - Temperature contrast
+FvFm.emmTemp.1 = emmeans(FvFm.glm, ~ Treatment|Strain, type = 'response', 
+                         at = list(Timepoint = c('t1','t2','t3'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+FvFm.emmTemp.1
+
+FvFm.emmTemp.2 = emmeans(FvFm.glm, ~ Treatment|Strain, type = 'response', 
+                         at = list(Timepoint = c('t4','t5','t6'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+FvFm.emmTemp.2
+
+FvFm.emmTemp.3 = emmeans(FvFm.glm, ~Treatment|Strain, type = 'response', 
+                         at = list(Timepoint = c('t7','t8','t9', "t10"))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+FvFm.emmTemp.3
+
+#Create dfs for each species containing EMMEANS of FvFm over time
+FvFm.glm.A <- glm(FvFm ~ Strain * Treatment * Day, data = subset(FvFm.df, Species == "S. pilosum"),
+                  family = Gamma(link = 'logit'))
+
+FvFm.emm.A = emmeans(FvFm.glm.A, ~ Treatment|Day*Strain, type = 'response') %>%
+  as.data.frame() %>%
+  mutate(Species = "S. pilosum")
+
+FvFm.glm.D <- glm(FvFm ~ Strain * Treatment * Day, data = subset(FvFm.df, Species == "D. trenchii"),
+                  family = Gamma(link = 'logit'))
+
+FvFm.emm.D = emmeans(FvFm.glm.D, ~ Treatment|Day*Strain, type = 'response') %>%
+  as.data.frame() %>%
+  mutate(Species = "D. trenchii") 
+
+FvFm.glm.F <- glm(FvFm ~ Strain * Treatment * Day, data = subset(FvFm.df, Species == "F. kawagutii"),
+                  family = Gamma(link = 'logit'))
+
+FvFm.emm.F = emmeans(FvFm.glm.F, ~ Treatment|Day*Strain, type = 'response') %>%
+  as.data.frame() %>%
+  mutate(Species = "F. kawagutii") 
+
+#Merge dfs
+FvFm.emm <- merge(FvFm.emm.A, FvFm.emm.D,
+                  by = c("Species", "Treatment", "Strain", "response", "SE", "df", "lower.CL", "upper.CL"),
+                  all = TRUE) %>%
+  merge(FvFm.emm.F,
+        by = c("Species", "Treatment", "Strain", "response", "SE", "df", "lower.CL", "upper.CL"),
+        all = TRUE) %>%
+  mutate(Time = coalesce(Day.x,Day.y, Day)) %>%
+  select(!c("Day.x", "Day.y", "Day")) %>%
+  rename(Day = Time) %>%
+  mutate(Day = as.numeric(as.character(Day)))
+```
+
+## Qm - GLM with EMM
+```{r}
+Qm.df <- RTE.df %>%
+  dplyr::select(Species, Treatment, Strain, Day, Timepoint, ExpPhase, Qm) %>%
+  drop_na() %>%
+  mutate(Qm = case_when(Qm == 0 ~ 0.001,
+                        Qm == 1 ~ 0.95,
+                        TRUE ~ Qm))
+
+#Check that all objects are factors (Day/Timepoint should be kept as factor)
+str(Qm.df)
+Qm.df$Qm <- as.numeric(Qm.df$Qm)
+Qm.df$Day <- as.factor(Qm.df$Day)
+Qm.df$Timepoint <- as.factor(Qm.df$Timepoint)
+Qm.df$Treatment <- as.factor(Qm.df$Treatment)
+Qm.df$Species <- as.factor(Qm.df$Species)
+Qm.df$Strain <- as.factor(Qm.df$Strain)
+str(Qm.df)
+
+#Fit Qmdf to a GLM - family quasibinomial
+Qm.glm <- glm(Qm ~ Strain * Treatment * Timepoint, data = subset(Qm.df, Species == "S. pilosum"), #Change per species
+              family = quasibinomial(link = 'log'))
+
+#ANOVA for main interactions
+anova(Qm.glm, test="F")
+summary(Qm.glm)
+
+#EMMEANS - Strain contrast (by early, mid and late experimental phase)
+Qm.emmStr.1 = emmeans(Qm.glm, ~ Strain|Treatment, type = 'response',
+                      at = list(Timepoint = c('t1','t2','t3'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+Qm.emmStr.1
+
+Qm.emmStr.2 = emmeans(Qm.glm, ~ Strain|Treatment, type = 'response',
+                      at = list(Timepoint = c('t4','t5','t6'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+Qm.emmStr.2
+
+Qm.emmStr.3 = emmeans(Qm.glm, ~ Strain|Treatment, type = 'response',
+                      at = list(Timepoint = c('t7','t8','t9', 't10'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+Qm.emmStr.3
+
+#EMMEANS - Temperature contrast
+Qm.emmTemp.1 = emmeans(Qm.glm, ~ Treatment|Strain, type = 'response',
+                       at = list(Timepoint = c('t1','t2','t3'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+Qm.emmTemp.1
+
+Qm.emmTemp.2 = emmeans(Qm.glm, ~ Treatment|Strain, type = 'response',
+                       at = list(Timepoint = c('t4','t5','t6'))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+Qm.emmTemp.2
+
+Qm.emmTemp.3 = emmeans(Qm.glm, ~Treatment|Strain, type = 'response',
+                       at = list(Timepoint = c('t7','t8','t9', "t10"))) %>%
+  pairs() %>%
+  summary(infer = TRUE)
+Qm.emmTemp.3
+
+#Create dfs for each species containings EMMEANS of Qm over time
+Qm.glm.A <- glm(Qm ~ Strain * Treatment * Day, data = subset(Qm.df, Species == "S. pilosum"),
+                family = quasibinomial(link = 'log'))
+
+Qm.emm.A = emmeans(Qm.glm.A, ~Treatment|Day*Strain, type = 'response') %>%
+  as.data.frame() %>%
+  mutate(Species = "S. pilosum")
+
+Qm.glm.D <- glm(Qm ~ Strain * Treatment * Day, data = subset(Qm.df, Species == "D. trenchii"),
+                family = quasibinomial(link = 'log'))
+
+Qm.emm.D = emmeans(Qm.glm.D, ~Treatment|Day*Strain, type = 'response') %>%
+  as.data.frame() %>%
+  mutate(Species = "D. trenchii") 
+
+Qm.glm.F <- glm(Qm ~ Strain * Treatment * Day, data = subset(Qm.df, Species == "F. kawagutii"),
+                family = quasibinomial(link = 'log'))
+
+Qm.emm.F = emmeans(Qm.glm.F, ~Treatment|Day*Strain, type = 'response') %>%
+  as.data.frame() %>%
+  mutate(Species = "F. kawagutii") 
+
+#Merge dfs
+Qm.emm <- merge(Qm.emm.A, Qm.emm.D,
+                by = c("Species", "Treatment", "Strain", "prob", "SE", "df", "asymp.LCL", "asymp.UCL"),
+                all = TRUE) %>%
+  merge(Qm.emm.F,
+        by = c("Species", "Treatment", "Strain", "prob", "SE", "df", "asymp.LCL", "asymp.UCL"),
+        all = TRUE) %>%
+  mutate(Time = coalesce(Day.x,Day.y, Day)) %>%
+  dplyr::select((!(Day.x:Day))) %>%
+  rename(Day = Time) %>%
+  mutate(Day = as.numeric(as.character(Day)))
+```
+
+
+## InROS - GLM with EMMEANS
+```{r}
+InROS.df <- RTE.df %>%
+  dplyr::select(Species, Treatment, Strain, Day, Replicate, InROS) %>%
+  drop_na() %>%
+  group_by(Species, Strain, Day, Replicate) %>%
+  mutate(InROSdelta = InROS[Treatment == 'Elevated'] - InROS[Treatment == 'Ambient']) %>%
+  ungroup() %>%
+  dplyr::select(Species, Strain, Day, InROSdelta)
+
+str(InROS.df)
+InROS.df$InROSdelta <- as.numeric(InROS.df$InROSdelta)
+InROS.df$Day <- as.factor(InROS.df$Day)
+InROS.df$Species <- as.factor(InROS.df$Species)
+InROS.df$Strain <- as.factor(InROS.df$Strain)
+str(InROS.df)
+
+#GLM - family gaussian
+InROS.glm <- glm(InROSdelta ~ Strain * Day, data = subset(InROS.df, Species == "S. pilosum"), #Change per species
+              family = gaussian(link = 'identity'))
+
+#ANOVA for main interactions
+anova(InROS.glm, test = "F")
+summary(InROS.glm)
+
+#EMMEANS - Strain contrast
+InROS.emmStr = emmeans(InROS.glm, ~ Strain|Day, type = 'response') %>%
+  pairs() %>%
+  summary(infer = TRUE)
+InROS.emmStr
+```
+
+## ExROS - GLM with EMMEANS
+```{r}
+ExROS.df <- RTE.df %>%
+  dplyr::select(Species, Treatment, Strain, Day, Replicate, ExROS) %>%
+  drop_na() %>%
+  group_by(Species, Strain, Day, Replicate) %>%
+  mutate(ExROSdelta = ExROS[Treatment == 'Elevated'] - ExROS[Treatment == 'Ambient']) %>%
+  ungroup() %>%
+  dplyr::select(Species, Strain, Day, ExROSdelta)
+
+str(ExROS.df)
+ExROS.df$ExROSdelta <- as.numeric(ExROS.df$ExROSdelta)
+ExROS.df$Day <- as.factor(ExROS.df$Day)
+ExROS.df$Species <- as.factor(ExROS.df$Species)
+ExROS.df$Strain <- as.factor(ExROS.df$Strain)
+str(ExROS.df)
+
+#GLM - family gaussian
+ExROS.glm <- glm(ExROSdelta ~ Strain * Day, data = subset(ExROS.df, Species == "S. pilosum"), #Change per species
+              family = gaussian())
+
+#ANOVA for main interactions
+anova(ExROS.glm, test = "F")
+summary(ExROS.glm)
+
+#EMMEANS - Strain contrast
+ExROS.emmStr = emmeans(ExROS.glm, ~ Strain|Day, type = 'response') %>%
+  pairs() %>%
+  summary(infer = TRUE)
+ExROS.emmStr
+```
+
+## NO3 uptake rates - GLM with EMM
+```{r}
+NuNO3.df <- RTE.df %>%
+  dplyr::select(Species, Strain, Treatment, NuNO3) %>%
+  drop_na()
+
+str(NuNO3.df)
+NuNO3.df$NuNO3 <- as.numeric(NuNO3.df$NuNO3)
+NuNO3.df$Treatment <- as.factor(NuNO3.df$Treatment)
+NuNO3.df$Species <- as.factor(NuNO3.df$Species)
+NuNO3.df$Strain <- as.factor(NuNO3.df$Strain)
+str(NuNO3.df)
+
+#Fit NuNO3.df to a GLM - family quasibinomial
+NuNO3.glm <- glm(NuNO3 ~ Strain * Treatment, data = subset(NuNO3.df, Species == "S. pilosum"), # Change df for each species
+                 family = quasibinomial(link = 'log'))
+
+#ANOVA for main interactions
+anova(NuNO3.glm, test="F")
+summary(NuNO3.glm)
+
+#EMMEANS - Strain contrast
+Nu.emmStr = emmeans(NuNO3.glm, ~ Strain|Treatment, type = 'response') %>%
+  pairs() %>%
+  summary(infer = TRUE)
+Nu.emmStr
+
+#EMMEANS - Temperature contrast
+Nu.emmTemp = emmeans(NuNO3.glm, ~ Treatment|Strain, type = 'response') %>%
+  pairs() %>%
+  summary(infer = TRUE)
+Nu.emmTemp
+```
+
+## PO4 uptake rates - GLM with EMM
+```{r}
+NuPO4.df <- RTE.df %>%
+  dplyr::select(Species, Strain, Treatment, NuPO4) %>%
+  drop_na()
+
+str(NuPO4.df)
+NuPO4.df$NuPO4 <- as.numeric(NuPO4.df$NuPO4)
+NuPO4.df$Treatment <- as.factor(NuPO4.df$Treatment)
+NuPO4.df$Species <- as.factor(NuPO4.df$Species)
+NuPO4.df$Strain <- as.factor(NuPO4.df$Strain)
+str(NuPO4.df)
+
+#Fit NuPO4.df to a GLM - family quasibinomial
+NuPO4.glm <- glm(NuPO4 ~ Strain * Treatment, data = subset(NuPO4.df, Species == "S. pilosum"), # Change df for each species
+                 family = quasibinomial(link = 'log'))
+
+#ANOVA for main interactions
+anova(NuPO4.glm, test="F")
+summary(NuPO4.glm)
+
+#EMMEANS - Strain contrast
+Nu.emmStr = emmeans(NuPO4.glm, ~ Strain|Treatment, type = 'response') %>%
+  pairs() %>%
+  summary(infer = TRUE)
+Nu.emmStr
+
+#EMMEANS - Temperature contrast
+Nu.emmTemp = emmeans(NuPO4.glm, ~ Treatment|Strain, type = 'response') %>%
+  pairs() %>%
+  summary(infer = TRUE)
+Nu.emmTemp
+```
+
+# Plots
+
+## Plot CellD using output from EMMEANS
+```{r}
+CellD.plot <- CellD.emm %>%
+  ggplot(aes(y = response, x = Day, fill = Strain, colour = Strain)) +
+  geom_pointrange(aes(ymin =lower.CL, ymax = upper.CL), size = 0.75,pch = 21,shape = 0) +
+  geom_line(size = 1) +
+  geom_vline(aes(xintercept=9), linetype = "dashed") +
+  geom_vline(aes(xintercept=21), linetype = "dashed") +
+  facet_grid(Treatment~Species,labeller=labeller(Treatment=treatment.labs)) +
+  scale_x_continuous('Time (days)',breaks=(0:34*3),expand=c(0,0),limits= c(0,34)) +
+  scale_y_continuous('Cell density (cells/ml)', labels = scales::scientific, breaks=(0:1800000*300000), 
+                     expand = c(0,0), limits = c(0,1800000)) + 
+  scale_fill_manual(values=c("#6699CC", "#E1BE6A")) +
+  scale_colour_manual(values=c("#6699CC", "#E1BE6A")) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing.y = unit(2, "lines"),
+        panel.spacing.x = unit(0.5, "lines"),
+        strip.text.x = element_text(size = 20, face = "bold.italic"),
+        strip.text.y = element_text(size = 20, face = "bold"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 18),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 20, colour = "black"),
+        axis.text.x = element_text(size = 18, colour = "black"), 
+        axis.title.y = element_text(size = 20, colour = "black"), 
+        axis.text.y = element_text(size = 18, colour = "black")) +
+  labs(tag = "A")
+CellD.plot
+```
+
+## Plot growth rate
+```{r}
+GrowthR.plot <- GrowthR.df %>%
+  ggplot(aes(y = mean_GrowthR, x = Species, fill = Strain, group = interaction(Strain, Treatment))) +
+  geom_col_pattern(aes(pattern = Treatment), pattern_density = 0.1, pattern_spacing = 0.02,
+                   pattern_fill = 'black', pattern_size = 0.05, position=position_dodge(), colour="black") + 
+  geom_errorbar(aes(ymin = mean_GrowthR - se_GrowthR, ymax = mean_GrowthR + se_GrowthR), width = 0.2, position=position_dodge(0.9)) +
+  scale_y_continuous(expand=c(0,0), limits=c(0,0.15), breaks = c(0, 0.05, 0.1, 0.15)) +
+  scale_fill_manual(values=c("#6699CC", "#E1BE6A")) +
+  xlab("Symbiont species") +
+  ylab(expression(Growth~rate~(d^-1))) + 
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing.x = unit(0, "lines"),
+        strip.text.x = element_text(size = 20, face = "bold"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 18),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 20, colour = "black"),
+        axis.text.x = element_text(size = 18, colour = "black", face = "italic"), 
+        axis.title.y = element_text(size = 20, colour = "black"), 
+        axis.text.y = element_text(size = 18, colour = "black")) +
+  labs(tag = "B") +
+  guides(pattern = guide_legend(override.aes = list(fill = "white")),
+         fill = guide_legend(override.aes = list(pattern = "none")))
+GrowthR.plot
+```
+
+## Plot photochemical efficiency using output from EMMEANS
+```{r}
+FvFm.plot <- FvFm.emm %>%
+  ggplot(aes(y = response, x = Day, fill = Strain, colour = Strain)) +
+  geom_pointrange(aes(ymin = lower.CL, ymax = upper.CL),size=0.75, pch=21, shape = 0) +
+  geom_line(size = 1) +
+  geom_vline(aes(xintercept=9), linetype = "dashed") +
+  geom_vline(aes(xintercept=21), linetype = "dashed") +
+  facet_grid(Treatment~Species,labeller=labeller(Treatment=treatment.labs)) +
+  scale_x_continuous('Time (days)', breaks=(0:34*3), expand = c(0,0), limits = c(0,34)) +
+  scale_y_continuous(expression(Maximum~quantum~yield~(F[v]/F[m])), expand = c(0,0), limits = c(0,0.6)) +
+  scale_fill_manual(values=c("#6699CC", "#E1BE6A")) +
+  scale_colour_manual(values=c("#6699CC", "#E1BE6A")) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing.y = unit(2, "lines"),
+        panel.spacing.x = unit(0.5, "lines"),
+        strip.text.x = element_text(size = 20, face = "bold.italic"),
+        strip.text.y = element_text(size = 20, face = "bold"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 18),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 20, colour = "black"),
+        axis.text.x = element_text(size = 18, colour = "black"), 
+        axis.title.y = element_text(size = 20, colour = "black"), 
+        axis.text.y = element_text(size = 18, colour = "black")) +
+  labs(tag = "A")
+FvFm.plot
+
+Qm.plot <- Qm.emm %>%
+  ggplot(aes(y = prob, x = Day, fill = Strain, colour = Strain)) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL),size=0.75, pch=21, shape = 0) +
+  geom_line(size = 1) +
+  geom_vline(aes(xintercept=9), linetype = "dashed") +
+  geom_vline(aes(xintercept=21), linetype = "dashed") +
+  facet_grid(Treatment~Species,labeller=labeller(Treatment=treatment.labs)) +
+  scale_x_continuous('Time (days)', breaks=(0:34*3), expand = c(0,0), limits = c(0,34)) +
+  scale_y_continuous(expression(Maximum~excitation~pressure~(Q[m])), expand = c(0,0), limits = c(0,1)) +
+  scale_fill_manual(values=c("#6699CC", "#E1BE6A")) +
+  scale_colour_manual(values=c("#6699CC", "#E1BE6A")) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing.y = unit(2, "lines"),
+        panel.spacing.x = unit(0.5, "lines"),
+        strip.text.x = element_text(size = 20, face = "bold.italic"),
+        strip.text.y = element_text(size = 20, face = "bold"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 18),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 20, colour = "black"),
+        axis.text.x = element_text(size = 18, colour = "black"), 
+        axis.title.y = element_text(size = 20, colour = "black"), 
+        axis.text.y = element_text(size = 18, colour = "black")) +
+  labs(tag = "B")
+Qm.plot
+```
+
+## Plot ROS accumulation
+```{r}
+InROS.plot <- RTE.df %>%
+  dplyr::select(Species, Treatment, Strain, Day, Replicate, InROS) %>%
+  drop_na() %>%
+  group_by(Species, Strain, Day, Replicate) %>%
+  mutate(InROSdelta = InROS[Treatment == 'Elevated'] - InROS[Treatment == 'Ambient']) %>%
+  ungroup() %>%
+  ggplot(aes(y = InROSdelta, x = Day, group = interaction(Day, Strain), fill = Strain)) +
+  geom_boxplot(width = 1.5, outlier.shape = NA, position=position_dodge(width=2)) +
+  geom_hline(yintercept=0, linetype="dashed", color = "black") +
+  facet_grid(.~Species) +
+  scale_x_continuous('Time (days)', breaks=(0:38*8), expand = c(0,0), limits = c(0,38)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-500,1500)) +
+  ylab(expression(Delta~intracellular~ROS~(median~fluorescent~intensity)))+
+  scale_fill_manual(values=c("#6699CC", "#E1BE6A")) +
+  scale_colour_manual(values=c("#6699CC", "#E1BE6A")) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing = unit(0, "lines"),
+        strip.text.x = element_text(size = 20, face = "bold.italic"),
+        strip.text.y = element_text(size = 20, face = "bold"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 18),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 20, colour = "black"),
+        axis.text.x = element_text(size = 18, colour = "black"), 
+        axis.title.y = element_text(size = 20, colour = "black"), 
+        axis.text.y = element_text(size=18, colour = "black")) +
+  labs(tag = "A")
+InROS.plot
+
+ExROS.plot <- RTE.df %>%
+  dplyr::select(Species, Treatment, Strain, Day, Replicate, ExROS) %>%
+  drop_na() %>%
+  group_by(Species, Strain, Day, Replicate) %>%
+  mutate(ExROSdelta = ExROS[Treatment == 'Elevated'] - ExROS[Treatment == 'Ambient']) %>%
+  ungroup() %>%
+  ggplot(aes(y = ExROSdelta, x = Day, group = interaction(Day, Strain), fill = Strain)) +
+  geom_boxplot(width = 1.5, outlier.shape = NA, position=position_dodge(width=2)) +
+  geom_hline(yintercept=0, linetype="dashed", color = "black") +
+  facet_grid(.~Species) +
+  scale_x_continuous('Time (days)', breaks=(0:38*8), expand = c(0,0), limits = c(0,38)) +
+  scale_y_continuous(expand = c(0,0), limits = c(-0.001,0.004)) +
+  ylab(expression(Delta~extracellular~ROS~(absorbance/cell~density)))+
+  scale_fill_manual(values=c("#6699CC", "#E1BE6A")) +
+  scale_colour_manual(values=c("#6699CC", "#E1BE6A")) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing = unit(0, "lines"),
+        strip.text.x = element_text(size = 20, face = "bold.italic"),
+        strip.text.y = element_text(size = 20, face = "bold"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 18),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 20, colour = "black"),
+        axis.text.x = element_text(size = 18, colour = "black"), 
+        axis.title.y = element_text(size = 20, colour = "black"), 
+        axis.text.y = element_text(size=18, colour = "black")) +
+  labs(tag = "B")
+ExROS.plot
+```
+
+## Plot nutrient concentrations over time
+```{r}
+NH4.plot <- RTE.df %>%
+  group_by(Species, Treatment, Day, Strain) %>%
+  mutate(mean_NH4 = mean(NH4)) %>%
+  mutate(sd_NH4 = sd(NH4)) %>%
+  mutate(se_NH4 = sd(NH4)/sqrt(length(NH4))) %>%
+  ungroup() %>%
+  ggplot(aes(y = mean_NH4, x = Day)) +
+  geom_line(aes(colour = Strain), size = 1.5) +
+  geom_errorbar(aes(ymin = mean_NH4 - se_NH4, ymax = mean_NH4 + se_NH4, colour = Strain), width = 0.5, size = 1.5)  +
+  geom_point(aes(fill = Strain), size = 2, pch = 21, shape = 0) +
+  facet_grid(Treatment~Species, labeller = labeller(Treatment = treatment.labs)) +
+  scale_x_continuous('Time (days)', breaks=(0:38*6), expand = c(0,0), limits = c(0,38)) +
+  scale_y_continuous(expression(NH[4]~concentration~(µmol/l)), expand = c(0,0), limits = c(0,100)) +
+  scale_fill_manual(values=c("#6699CC", "#E1BE6A")) +
+  scale_colour_manual(values=c("#6699CC", "#E1BE6A")) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(), 
+        panel.grid.major.y = element_line(size = 0.1, colour = "black"),
+        panel.spacing = unit(0.75, "lines"),
+        strip.text.x = element_text(size = 20, face = "bold.italic"),
+        strip.text.y = element_text(size = 20, face = "bold"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 18),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 20, colour = "black"),
+        axis.text.x = element_text(size = 18, colour = "black"), 
+        axis.title.y = element_text(size = 20, colour = "black"),
+        axis.text.y = element_text(size = 18, colour = "black")) +
+  labs(tag = "A")
+NH4.plot
+
+NO3.plot <- RTE.df %>%
+  group_by(Species, Treatment, Day, Strain) %>%
+  mutate(mean_NO3 = mean(NO3)) %>%
+  mutate(sd_NO3 = sd(NO3)) %>%
+  mutate(se_NO3 = sd(NO3)/sqrt(length(NO3))) %>%
+  ungroup() %>%
+  ggplot(aes(y = mean_NO3, x = Day)) +
+  geom_line(aes(colour = Strain), size = 1.5) +
+  geom_errorbar(aes(ymin = mean_NO3 - se_NO3, ymax = mean_NO3 + se_NO3, colour = Strain), width = 0.5, size = 1.5)  +
+  geom_point(aes(fill = Strain), size = 2, pch = 21, shape = 0) +
+  facet_grid(Treatment~Species, labeller = labeller(Treatment = treatment.labs)) +
+  scale_x_continuous('Time (days)', breaks=(0:38*6), expand = c(0,0), limits = c(0,38)) +
+  scale_y_continuous(expression(NO[3]~concentration~(µmol/l)), expand = c(0,0), limits = c(0,3000)) +
+  scale_fill_manual(values=c("#6699CC", "#E1BE6A")) +
+  scale_colour_manual(values=c("#6699CC", "#E1BE6A")) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(), 
+        panel.grid.major.y = element_line(size = 0.1, colour = "black"),
+        panel.spacing = unit(0.75, "lines"),
+        strip.text.x = element_text(size = 20, face = "bold.italic"),
+        strip.text.y = element_text(size = 20, face = "bold"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 18),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 20, colour = "black"),
+        axis.text.x = element_text(size = 18, colour = "black"), 
+        axis.title.y = element_text(size = 20, colour = "black"),
+        axis.text.y = element_text(size = 18, colour = "black")) +
+  labs(tag = "B")
+NO3.plot
+
+PO4.plot <- RTE.df %>%
+  group_by(Species, Treatment, Day, Strain) %>%
+  mutate(mean_PO4 = mean(PO4)) %>%
+  mutate(sd_PO4 = sd(PO4)) %>%
+  mutate(se_PO4 = sd(PO4)/sqrt(length(PO4))) %>%
+  ungroup() %>%
+  ggplot(aes(y = mean_PO4, x = Day)) +
+  geom_line(aes(colour = Strain), size = 1.5) +
+  geom_errorbar(aes(ymin = mean_PO4 - se_PO4, ymax = mean_PO4 + se_PO4, colour = Strain), width = 0.5, size = 1.5)  +
+  geom_point(aes(fill = Strain), size = 2, pch = 21, shape = 0) +
+  facet_grid(Treatment~Species, labeller = labeller(Treatment = treatment.labs)) +
+  scale_x_continuous('Time (days)', breaks=(0:38*6), expand = c(0,0), limits = c(0,38)) +
+  scale_y_continuous(expression(PO[4]~concentration~(µmol/l)), expand = c(0,0), limits = c(0,40)) +
+  scale_fill_manual(values=c("#6699CC", "#E1BE6A")) +
+  scale_colour_manual(values=c("#6699CC", "#E1BE6A")) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(), 
+        panel.grid.major.y = element_line(size = 0.1, colour = "black"),
+        panel.spacing = unit(0.75, "lines"),
+        strip.text.x = element_text(size = 20, face = "bold.italic"),
+        strip.text.y = element_text(size = 20, face = "bold"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 18),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 20, colour = "black"),
+        axis.text.x = element_text(size = 18, colour = "black"), 
+        axis.title.y = element_text(size = 20, colour = "black"),
+        axis.text.y = element_text(size = 18, colour = "black")) +
+  labs(tag = "C")
+PO4.plot
+```
+
+
+## Plot nutrient uptake rates
+```{r}
+NuNO3.plot <- RTE.df %>%
+  ggplot(aes(y = NuNO3, x = Species, fill = Strain)) +
+  geom_boxplot_pattern(aes(pattern = Treatment), pattern_density = 0.1, pattern_spacing = 0.02,
+                       pattern_fill = 'black', pattern_size = 0.05, position=position_dodge(), colour="black") +
+  scale_y_continuous(expand=c(0,0), limits=c(0,0.00015), breaks = c(0, 0.00005, 0.0001, 0.00015)) +
+  scale_fill_manual(values=c("#6699CC", "#E1BE6A")) +
+  xlab("Symbiont species") +
+  ylab(expression(Nitrate~uptake~rate(mu*mol/cell/day))) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing.x = unit(0, "lines"),
+        strip.text.x = element_text(size = 20, face = "bold"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 18),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 20, colour = "black"),
+        axis.text.x = element_text(size = 18, colour = "black", face = "italic"), 
+        axis.title.y = element_text(size = 20, colour = "black"), 
+        axis.text.y = element_text(size = 18, colour = "black")) +
+  labs(tag = "A") +
+  guides(pattern = guide_legend(override.aes = list(fill = "white")),
+        fill = guide_legend(override.aes = list(pattern = "none")))
+NuNO3.plot
+
+NuPO4.plot <- RTE.df %>%
+  ggplot(aes(y = NuPO4, x = Species, fill = Strain)) +
+  geom_boxplot_pattern(aes(pattern = Treatment), pattern_density = 0.1, pattern_spacing = 0.02,
+                       pattern_fill = 'black', pattern_size = 0.05, position=position_dodge(), colour="black") +
+  scale_y_continuous(expand=c(0,0), limits=c(0,0.000015), breaks = c(0, 0.000005, 0.00001, 0.000015)) +
+  scale_fill_manual(values=c("#6699CC", "#E1BE6A")) +
+  xlab("Symbiont species") +
+  ylab(expression(Phosphate~uptake~rate(mu*mol/cell/day))) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing.x = unit(0, "lines"),
+        strip.text.x = element_text(size = 20, face = "bold"),
+        legend.title = element_text(size = 20, face = "bold"),
+        legend.text = element_text(size = 18),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 20, colour = "black"),
+        axis.text.x = element_text(size = 18, colour = "black", face = "italic"), 
+        axis.title.y = element_text(size = 20, colour = "black"), 
+        axis.text.y = element_text(size = 18, colour = "black")) +
+  labs(tag = "B") +
+  guides(pattern = guide_legend(override.aes = list(fill = "white")),
+         fill = guide_legend(override.aes = list(pattern = "none")))
+NuPO4.plot
+```
+
+## Spider plot of trait summary
+```{r}
+#Subset radar plot df for each species
+RTE_trait_sum.df_A <- RTE_trait_sum.df[c(3,6),]
+RTE_trait_sum.df_D <- RTE_trait_sum.df[c(1,4),]
+RTE_trait_sum.df_F <- RTE_trait_sum.df[c(2,5),]
+
+Radarplot.A <- RTE_trait_sum.df_A %>%
+  ggradar(values.radar = c(0, 0.5, 1),
+          axis.labels = paste0(c("Cell density yields", 
+                                 "Growth rate",
+                                 "Fv/Fm", "Qm",
+                                 "InROS levels",
+                                 "ExROS levels",
+                                 "NO3 uptake rate",
+                                 "PO4 uptake rate")),
+          group.line.width = 1, 
+          group.point.size = 3,
+          background.circle.colour = "white",
+          gridline.min.colour = "gray60",
+          gridline.mid.colour = "gray60",
+          gridline.max.colour = "gray60",
+          gridline.min.linetype = 1,
+          gridline.mid.linetype = 1,
+          gridline.max.linetype = 1,
+          fill = TRUE,
+          fill.alpha = 0.2,
+          group.colours = c('#004D40','#C73128'),
+          plot.legend = TRUE)
+Radarplot.A
+
+Radarplot.D <- RTE_trait_sum.df_D %>%
+  ggradar(values.radar = c(0, 0.5, 1),
+          axis.labels = paste0(c("Cell density yields", 
+                                 "Growth rate",
+                                 "Fv/Fm", "Qm",
+                                 "InROS levels",
+                                 "ExROS levels",
+                                 "NO3 uptake rate",
+                                 "PO4 uptake rate")),
+          group.line.width = 1, 
+          group.point.size = 3,
+          background.circle.colour = "white",
+          gridline.min.colour = "gray60",
+          gridline.mid.colour = "gray60",
+          gridline.max.colour = "gray60",
+          gridline.min.linetype = 1,
+          gridline.mid.linetype = 1,
+          gridline.max.linetype = 1,
+          fill = TRUE,
+          fill.alpha = 0.2,
+          group.colours = c('#004D40','#C73128'),
+          plot.legend = TRUE)
+Radarplot.D
+
+Radarplot.F <- RTE_trait_sum.df_F %>%
+  ggradar(values.radar = c(0, 0.5, 1),
+          axis.labels = paste0(c("Cell density yields", 
+                                 "Growth rate",
+                                 "Fv/Fm", "Qm",
+                                 "InROS levels",
+                                 "ExROS levels",
+                                 "NO3 uptake rate",
+                                 "PO4 uptake rate")),
+          group.line.width = 1, 
+          group.point.size = 3,
+          background.circle.colour = "white",
+          gridline.min.colour = "gray60",
+          gridline.mid.colour = "gray60",
+          gridline.max.colour = "gray60",
+          gridline.min.linetype = 1,
+          gridline.mid.linetype = 1,
+          gridline.max.linetype = 1,
+          fill = TRUE,
+          fill.alpha = 0.2,
+          group.colours = c('#004D40','#C73128'),
+          plot.legend = TRUE)
+Radarplot.F
+```
+
+# Save the plots
+```{r}
+ggsave(plot = CellD.plot, "Fig. 1A.pdf",
+       path = "./", 
+       width = 15, height = 7.5, units = 'in', dpi = 300)
+
+ggsave(plot = GrowthR.plot, "Fig. 1B.pdf",
+       path = "./", 
+       width = 15, height = 7.5, units = 'in', dpi = 300)
+
+ggsave(plot = FvFm.plot, "Fig. 2A.pdf",
+       path = "./", 
+       width = 15, height = 7.5, units = 'in', dpi = 300)
+
+ggsave(plot = Qm.plot, "Fig. 2B.pdf",
+       path = "./", 
+       width = 15, height = 7.5, units = 'in', dpi = 300)
+
+ggsave(plot = InROS.plot, "Fig. 3A.pdf",
+       path = "./", 
+       width = 15, height = 7.5, units = 'in', dpi = 300)
+
+ggsave(plot = ExROS.plot, "Fig. 3B.pdf",
+       path = "./", 
+       width = 15, height = 7.5, units = 'in', dpi = 300)
+
+ggsave(plot = NH4.plot, "Fig. 4A.pdf",
+       path = "./", 
+       width = 15, height = 7.5, units = 'in', dpi = 300)
+
+ggsave(plot = NO3.plot, "Fig. 4B.pdf",
+       path = "./", 
+       width = 15, height = 7.5, units = 'in', dpi = 300)
+
+ggsave(plot = PO4.plot, "Fig. 4C.pdf",
+       path = "./", 
+       width = 15, height = 7.5, units = 'in', dpi = 300)
+
+ggsave(plot = NuNO3.plot, "Fig. 5A.pdf",
+       path = "./", 
+       width = 15, height = 7.5, units = 'in', dpi = 300)
+
+ggsave(plot = NuPO4.plot, "Fig. 5B.pdf",
+       path = "./", 
+       width = 15, height = 7.5, units = 'in', dpi = 300)
+```
