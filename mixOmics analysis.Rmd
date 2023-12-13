@@ -1,0 +1,266 @@
+---
+title: "mixOmics analysis"
+author: "Hugo Scharfenstein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+Load packages
+```{r}
+#General packages
+library(tidyverse)
+library(readxl)
+library(forcats)
+library(mixOmics)
+library(reshape2)
+```
+
+# Prepare dfs for analysis
+```{r}
+#Prepare dataframe with metadata
+metadata.mix <- sym_metadata.df %>%
+  mutate(SampleName = gsub("_S[0-9].*", "", SampleName)) %>%
+  rownames_to_column(var = "Old_row_ID") %>%
+  filter(!(SampleName %in% c('Amb_SS1_J_1062', 'Amb_SS1_L_1268', 'Amb_SS8_I_937', 'Amb_SS8_I_948','Amb_SS8_L_1258', 'Amb_SS8_L_1288',
+                             'Amb_WT10_J_1049', 'Amb_WT10_L_1307', 'Ele_RIC_J_1064', 'Ele_SS1_I_978', 'Ele_SS8_I_921', 'Ele_SS8_J_1033',
+                             'Ele_WT10_I_977'))) %>% #Remove samples with low abundance of C. proliferum
+  column_to_rownames(var = "SampleName")
+
+#Prepare dataframe with bleaching phenotype
+phenotype.mix <- Bleach.df2 %>%
+  dplyr::select(c(Temp_treatment, RI_treatment, Colony_ID, Plug_ID, RNAseq_sequenced, Mean_gray_value)) %>%
+  filter(RNAseq_sequenced == 'Yes') %>%
+  filter(!(Plug_ID %in% c('1028', '1290', '1322', '1334'))) %>%
+  filter(!(Plug_ID %in% c('1062', '1268', '937', '948','1258', '1288', '1049', '1307', '1064', '978', '921', '1033','977'))) %>% 
+  mutate(Temp_treatment = case_when(str_detect(Temp_treatment, 'Ambient') ~ 'Amb',
+                                    str_detect(Temp_treatment, 'Elevated') ~ 'Ele')) %>%
+  unite("SampleName", c('Temp_treatment', 'RI_treatment', 'Colony_ID', 'Plug_ID'), sep= "_", remove = T) %>%
+  dplyr::select(-(RNAseq_sequenced)) %>%
+  arrange(SampleName, metadata.mix$Old_row_ID) %>%
+  column_to_rownames(var = "SampleName")
+
+#Prepare matrix of vst gene counts for host (matrix will only contain significant DEGs)
+host_DEG.norm_mat <- host.vsd_DEGs.mat %>% as.data.frame()
+names(host_DEG.norm_mat) = gsub(pattern = "_S[0-9].*", replacement = "", x = names(host_DEG.norm_mat))
+host_DEG.norm_mat_transp = t(host_DEG.norm_mat) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = 'SampleName') %>%
+  filter(!(SampleName %in% c('Amb_RIC_J_1028', 'Ele_RIC_L_1290', 'Ele_SS8_L_1322', 'Ele_SS1_L_1334'))) %>% #Remove outliers
+  filter(!(SampleName %in% c('Amb_SS1_J_1062', 'Amb_SS1_L_1268', 'Amb_SS8_I_937', 'Amb_SS8_I_948','Amb_SS8_L_1258', 'Amb_SS8_L_1288',
+                             'Amb_WT10_J_1049', 'Amb_WT10_L_1307', 'Ele_RIC_J_1064', 'Ele_SS1_I_978', 'Ele_SS8_I_921', 'Ele_SS8_J_1033',
+                             'Ele_WT10_I_977'))) %>% #Remove samples with low abundance of C. proliferum
+  column_to_rownames(var = 'SampleName') %>%
+  as.matrix()
+#Remove samples that were thrown out from photosymbiont analysis 
+
+#Prepare matrix of vst gene counts for symbionts (matrix will only contain significant DEGs )
+sym_DEG.norm_mat <- sym.vsd_DEGs.mat %>% as.data.frame()
+names(sym_DEG.norm_mat) = gsub(pattern = "_S[0-9].*", replacement = "", x = names(sym_DEG.norm_mat))
+sym_DEG.norm_mat_transp = t(sym_DEG.norm_mat) %>%
+  as.data.frame() %>%
+  rownames_to_column(var = 'SampleName') %>%
+  filter(!(SampleName %in% c('Amb_SS1_J_1062', 'Amb_SS1_L_1268', 'Amb_SS8_I_937', 'Amb_SS8_I_948','Amb_SS8_L_1258', 'Amb_SS8_L_1288',
+                             'Amb_WT10_J_1049', 'Amb_WT10_L_1307', 'Ele_RIC_J_1064', 'Ele_SS1_I_978', 'Ele_SS8_I_921', 'Ele_SS8_J_1033',
+                             'Ele_WT10_I_977'))) %>% #Remove samples with low abundance of C. proliferum
+  column_to_rownames(var = 'SampleName') %>%
+  as.matrix()
+
+#Prepare matrix of DIV counts
+sym_DIV.mat <- DIV.df2 %>%
+  dplyr::select(c(Temp_treatment, RI_treatment, Colony_ID, Plug_ID, Rel_abundance, Seq, RNAseq_sequenced)) %>%
+  filter(RNAseq_sequenced == 'Yes') %>%
+  filter(!(Plug_ID %in% c('1028', '1290', '1322', '1334'))) %>%
+  filter(!(Plug_ID %in% c('1062', '1268', '937', '948','1258', '1288', '1049', '1307', '1064', '978', '921', '1033','977'))) %>% 
+  mutate(Temp_treatment = case_when(str_detect(Temp_treatment, 'Ambient') ~ 'Amb',
+                                    str_detect(Temp_treatment, 'Elevated') ~ 'Ele')) %>%
+  unite("Column_UID", c('Temp_treatment', 'RI_treatment', 'Colony_ID', 'Plug_ID'), sep= "_", remove = T) %>%
+  mutate(row = row_number()) %>%
+  pivot_wider(names_from = Column_UID, values_from = Rel_abundance) %>%
+  dplyr::select(-(RNAseq_sequenced), -(row)) %>%
+  group_by(Seq) %>%
+  summarise(across(everything(), 
+                   ~coalesce(.x) %>% 
+                     `[`(!is.na(.)) %>% 
+                     `[`(1) )) %>%
+  mutate_all(~replace(., is.na(.), 0)) %>%
+  column_to_rownames(var = "Seq")
+
+sym_DIV.mat_transp = t(sym_DIV.mat) %>% 
+  as.data.frame() %>%
+  rownames_to_column(var = 'Row_UID') %>%
+  arrange(Row_UID, metadata.mix$Old_row_ID) %>%
+  column_to_rownames(var = "Row_UID") %>%
+  as.matrix()
+
+#Check if row and column names match between metadata and other dfs
+all(rownames(host_DEG.norm_mat_transp) %in% rownames(metadata.mix)) 
+all(rownames(host_DEG.norm_mat_transp) == rownames(metadata.mix))
+
+all(rownames(sym_DEG.norm_mat_transp) %in% rownames(metadata.mix)) 
+all(rownames(sym_DEG.norm_mat_transp) == rownames(metadata.mix))
+
+all(rownames(sym_DIV.mat_transp) %in% rownames(metadata.mix)) 
+all(rownames(sym_DIV.mat_transp) == rownames(metadata.mix))
+
+all(rownames(phenotype.mix) %in% rownames(metadata.mix)) 
+all(rownames(phenotype.mix) == rownames(metadata.mix))
+```
+
+## Keep only samples from elevated temperatures since genes were differentially expressed in response to heat
+```{r}
+host_DEGs_ele <- host_DEG.norm_mat_transp %>%
+  as.data.frame() %>%
+  filter(!(row.names(host_DEG.norm_mat_transp) %in% c('Amb_C_I_1005', 'Amb_C_I_953', 'Amb_C_J_1075', 'Amb_C_J_1096', 'Amb_C_L_1304',
+                                                   'Amb_C_L_1308', 'Amb_RIC_I_939', 'Amb_RIC_I_989', 'Amb_RIC_L_1283', 'Amb_RIC_L_1312',
+                                                   'Amb_SS1_I_954', 'Amb_SS1_L_1331', 'Amb_SS8_J_1098', 'Amb_WT10_I_935', 
+                                                   'Amb_WT10_J_1093', 'Amb_WT10_L_1340'))) %>%
+  as.matrix()
+
+sym_DEGs_ele <- sym_DEG.norm_mat_transp %>%
+  as.data.frame() %>%
+  filter(!(row.names(sym_DEG.norm_mat_transp) %in% c('Amb_C_I_1005', 'Amb_C_I_953', 'Amb_C_J_1075', 'Amb_C_J_1096', 'Amb_C_L_1304',
+                                                   'Amb_C_L_1308', 'Amb_RIC_I_939', 'Amb_RIC_I_989', 'Amb_RIC_L_1283', 'Amb_RIC_L_1312',
+                                                   'Amb_SS1_I_954', 'Amb_SS1_L_1331', 'Amb_SS8_J_1098', 'Amb_WT10_I_935', 
+                                                   'Amb_WT10_J_1093', 'Amb_WT10_L_1340'))) %>%
+  as.matrix()
+
+
+metadata.mix_ele <- metadata.mix %>%
+  filter(str_detect(Old_row_ID, 'Ele'))
+
+all(rownames(host_DEGs_ele) %in% rownames(metadata.mix_ele)) 
+all(rownames(host_DEGs_ele) == rownames(metadata.mix_ele))
+
+all(rownames(sym_DEGs_ele) %in% rownames(metadata.mix_ele)) 
+all(rownames(sym_DEGs_ele) == rownames(metadata.mix_ele))
+```
+
+## Pass data frames of interest to a list
+```{r}
+X <- list(hostDEGs = host_DEGs_ele,
+          symDEGs = sym_DEGs_ele)
+
+lapply(X, dim) #Check the dimensions (should have same number of rows)
+
+metadata.mix_ele2 <- metadata.mix_ele %>% dplyr::select(Temp_cprol_abund_strain)
+metadata.mix_ele3 <- as.factor(metadata.mix_ele2$Temp_cprol_abund_strain)
+Y <- metadata.mix_ele3 #Set the response variable as the Y df
+summary(Y)
+```
+# DIABLo analysis (following: https://mixomicsteam.github.io/mixOmics-Vignette/id_06.html)
+
+## Initial DIABLO Model
+```{r}
+#Design matrix
+design = matrix(0.5, ncol = length(X), nrow = length(X), 
+                dimnames = list(names(X), names(X)))
+diag(design) = 0 #Set diagonal to 0s
+design
+
+#Initial DIABLO model
+basic.diablo.model = block.splsda(X = X, Y = Y, ncomp = 5, design = design) 
+```
+
+## Tuning the number of components
+```{r}
+#Run component number tuning with repeated CV
+perf.diablo = perf(basic.diablo.model, validation = 'Mfold', 
+                   folds = 10, nrepeat = 10) 
+
+plot(perf.diablo) #Plot output of tuning
+
+#Show the optimal choice for ncomp for each dist metric
+perf.diablo$choice.ncomp$WeightedVote 
+
+#Set the optimal ncomp value
+ncomp = perf.diablo$choice.ncomp$WeightedVote["Overall.BER", "centroids.dist"]
+```
+
+## Tuning the number of features
+```{r}
+set.seed(123) #Set seed for reproducibility
+
+#Set grid of values for each component to test
+test.keepX <- list(hostDGE = c(5:9, seq(20,30,5)),
+                   symDGE = c(5:9, seq(20,30,5)))
+
+#Run the feature selection tuning
+tune.TCGA = tune.block.splsda(X = X, Y = Y, ncomp = ncomp, 
+                              test.keepX = test.keepX, design = design,
+                              validation = 'Mfold', folds = 4, nrepeat = 50,
+                              BPPARAM = BiocParallel::SnowParam(workers = 2),
+                              dist = "centroids.dist")
+list.keepX <- tune.TCGA$choice.keepX
+```
+
+## Final DIABLO model
+```{r}
+diablo.model <- block.splsda(X, Y, ncomp = ncomp,
+                             keepX = list.keepX, design = design)
+
+diablo.model$design
+
+host_comp1 <- selectVar(diablo.model, block = 'hostDEGs', comp = 1) %>% as.data.frame()
+host_comp2 <- selectVar(diablo.model, block = 'hostDEGs', comp = 2) %>% as.data.frame()
+host_comp3 <- selectVar(diablo.model, block = 'hostDEGs', comp = 3) %>% as.data.frame()
+host_comp <- rbind(host_comp1, host_comp2) %>%
+  rbind(host_comp3)
+
+sym_comp1 <- selectVar(diablo.model, block = 'symDEGs', comp = 1) %>% as.data.frame()
+sym_comp2 <- selectVar(diablo.model, block = 'symDEGs', comp = 2) %>% as.data.frame()
+sym_comp3 <- selectVar(diablo.model, block = 'symDEGs', comp = 3) %>% as.data.frame()
+sym_comp <- rbind(sym_comp1, sym_comp2) %>%
+  rbind(sym_comp3)
+```
+
+## Plots
+```{r}
+DEG_cor.arrow_plot <- plotArrow(diablo.model, ind.names = FALSE, legend = TRUE, arrow.size	= 0.25) +
+  scale_shape_manual('Block',
+                     labels = c('centroid', 'host DEGs', 'symbiont DEGs'),
+                     values = c(8, 21, 24)) +
+  scale_colour_manual('Photosymbiont strain',
+                      labels = c('C21', 'SS', 'WT10'),
+                      values = c('#0e3b5c', '#DB8941', '#9f6671'))
+DEG_cor.arrow_plot
+Fig.7A <- DEG_cor.arrow_plot
+
+pdf("Fig. 7B.pdf",
+    width = 10,
+    height = 7.5) 
+DEG_cor.circos_plot <- circosPlot(diablo.model, cutoff = 0.8, line = T,
+                           color.Y = c('#0e3b5c', '#DB8941', '#9f6671'),
+                           color.blocks = c('#40826D', '#b08968'),
+                           color.cor = c("darkred","darkblue"),
+                           var.adj = 1,
+                           block.labels.adj = 1,
+                           size.labels = 0.01,
+                           linkWidth = 0.5,
+                           size.variables = 0.5)
+dev.off()
+
+DEG_cor.circos_matrix <- DEG_cor.circos_plot
+
+DEG_cor.load_plot <- plotLoadings(diablo.model, comp = 1, contrib = 'max', method = 'median', 
+                                  legend = T, legend.color = c('#0e3b5c', '#DB8941', '#9f6671'))
+```
+
+# Merge panels into Figure 7
+```{r}
+ggsave(plot = Fig.7A, "Fig. 7A.pdf",
+       path = "./",
+       width = 8,
+       height = 6,
+       units = 'in',
+       dpi = 300,
+       device = cairo_pdf)
+
+Fig.7A2 <- image_read_pdf("./Fig. 7A.pdf")
+Fig.7B2 <- image_read_pdf("./Fig. 7B.pdf")
+
+Fig.7 <- c(Fig.7A2, Fig.7B2) %>% 
+    image_append(stack = F)
+
+cairo_pdf('./Fig. 7.pdf')
+plot(Fig.7)
+dev.off()
+```

@@ -1,0 +1,1862 @@
+---
+title: "RNAseq analysis - host"
+author: "Hugo Scharfenstein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Packages used for analysis
+```{r}
+#General packages
+library(tidyverse)
+library(reshape2)
+library(vegan)
+library(readxl)
+library(writexl)
+#DGE analysis packages
+library(DESeq2)
+library(edgeR)
+library(glmpca)
+library(apeglm)
+library(ashr)
+#ORA packages
+library(goseq)
+#Plotting packages
+library(EnhancedVolcano)
+library(PCAtools)
+library(DEGreport)
+library(RColorBrewer)
+library(ggpubr)
+library(ggridges)
+library(plotly)
+library(VennDiagram)
+#Other packages
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+library(digest)
+library(cluster)
+library(magick)
+library(rstatix)
+```
+
+# Import gene count matrices generated from STAR and associated metadata
+```{r}
+#Import metadata
+host_metadata.df <- read_xlsx("./RNAseq dataset.xlsx", sheet = 5)
+
+#Import the gene count matrix resulting from the mapping of sequences to the P. daedalea reference genome
+host_counts.df <- read_tsv("/Users/hugo/Documents/Melbourne PhD/Experimental work/Chapter 5/Gene counts matrices/gene_counts_matrix_pdae.txt")
+```
+
+# Collate exon counts to gene level
+```{r}
+#Host
+host_gene_counts.df <- host_counts.df %>% 
+  separate(gene_id, c("gene", "exon"), sep = "\\.exon") %>% 
+  group_by(gene) %>% 
+  summarise_if(is.numeric, sum)
+```
+
+# Decide on appropriate statistical model for downstream analysis 
+```{r}
+#Visualise RNA-seq count distribution for one sample
+ggplot(host_gene_counts.df) +
+  geom_histogram(aes(x = Amb_C_I_1005_S22_), stat = "bin", bins = 200) +
+  xlim(-5, 500) +
+  xlab("Raw expression counts") +
+  ylab("Number of genes")
+
+#Calculate mean and variance of count data
+mean_counts <- apply(host_gene_counts.df[, 3:5], 1, mean)
+variance_counts <- apply(host_gene_counts.df[, 3:5], 1, var)
+check.df <- data.frame(mean_counts, variance_counts)
+
+#Plot mean versus variance
+ggplot(check.df) +
+        geom_point(aes(x=mean_counts, y=variance_counts)) + 
+        geom_line(aes(x=mean_counts, y=mean_counts, color="red")) +
+        scale_y_log10() +
+        scale_x_log10()
+#Overall, the variance appears to be greater than mean of counts
+#This rules out use of Poisson distribution where mean=variance
+#Rather, a negative binomial model is more appropriate to this analysis (in this case DESeq2 will be used)
+```
+
+# Differential gene expression analysis - Deseq2
+
+## Preparation of gene count matrices for downstream analysis
+```{r}
+#Modify the host_metadata.df table, adding  sample names as row names (needed for some of the DESeq2 functions)
+host_metadata.df <- as.data.frame(host_metadata.df)
+rownames(host_metadata.df) <- host_metadata.df$SampleName
+
+#Modify the host_gene_counts.df, adding  gene ids as row names (needed for later)
+host_gene_counts.df <- as.data.frame(host_gene_counts.df)
+rownames(host_gene_counts.df) <- host_gene_counts.df$gene
+host_gene_counts.df <- host_gene_counts.df[,-1]
+
+#Check if row and column names match between host_metadata.df and host_gene_counts.df
+all(colnames(host_gene_counts.df) %in% rownames(host_metadata.df)) 
+all(colnames(host_gene_counts.df) == rownames(host_metadata.df))
+```
+
+## Load the gene count matrix into a DESeq DESeqDataSet object
+```{r}
+host.dds <- DESeqDataSetFromMatrix(countData = host_gene_counts.df,
+                                   colData = host_metadata.df,
+                                   design = ~ Cprol_abundance + Chemical_bleaching + Temp_treatment + Colony + Temp_treatment:Colony)
+
+#Design matrices incorporate chemical bleaching and colony as factors (though not of primary interest)
+#Dominant symbionts categories are based on whether more C1 or C21 is present in the respective samples
+#For guidance on design matrices check: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7873980/
+```
+
+## Filter out lowly expressed genes (genes where normalised counts are >= 5 across at least 1 sample are kept)
+```{r}
+#Perform the median of ratios method of normalization (from DESeq2) then filter genes
+host.dds <- estimateSizeFactors(host.dds)
+host.dds_filt <- rowSums(counts(host.dds, normalized = TRUE) >= 5) >= 1
+table(host.dds_filt)
+host.dds_filt2 <- host.dds[host.dds_filt,]
+#Roughly same number of genes (20-25,000) for host and symbiont analyses after filtering
+```
+
+## Exploratory analysis and visualization
+
+### VST transformation
+```{r}
+host.vsd <- vst(host.dds_filt2, blind = F)
+host.vsd.mat <- assay(host.vsd)
+```
+
+### Exploration of similarities between samples - PCA with PCAtools::pca
+```{r}
+host.PCA_tools <- PCAtools::pca(host.vsd.mat, metadata = host_metadata.df, removeVar = 0.1)
+host.PCA_tools$metadata$Cprol_abundance <- factor(host.PCA_tools$metadata$Cprol_abundance,
+                                                  levels = c("Absent", "Present", "Dominant"))
+
+#Screeplot to identiy optimal number of PCs
+host_horn <- parallelPCA(host.vsd.mat)
+host_horn$n
+
+host_elbow <- findElbowPoint(host.PCA_tools$variance)
+host_elbow
+
+host.PCA_tools.screeplot <- screeplot(host.PCA_tools,
+                                      components = getComponents(host.PCA_tools, 1:20),
+                                      vline = c(host_horn$n, host_elbow)) +
+  geom_label(aes(x = host_horn$n + 1, y = 50,
+                 label = 'Horn\'s', vjust = -1, size = 12)) +
+  geom_label(aes(x = host_elbow + 1, y = 50,
+                 label = 'Elbow method', vjust = -1, size = 12))
+host.PCA_tools.screeplot
+
+#Eigencorplot
+host.PCA_tools.eigenplot <- eigencorplot(host.PCA_tools,
+                                         metavars = c('Cprol_abundance', 'Chemical_bleaching', 
+                                                      'Temp_treatment','Colony', 'Mapping_depth_host'))
+host.PCA_tools.eigenplot
+
+#Biplot - ellipses by strain
+host.PCA_tools.biplot <- biplot(host.PCA_tools,
+                               x = "PC1",
+                               y = "PC2",
+                               lab = NA,
+                               colby = 'Colony',
+                               shape = 'Temp_treatment',
+                               pointSize = 3,
+                               hline = 0, hlineWidth = 0.25,
+                               vline = 0, vlineWidth = 0.25,
+                               xlim = c(-80, 80),
+                               ylim = c(-80, 80)) +
+  #geom_point(aes(alpha = host.PCA_tools$metadata$Cprol_abundance), size = 1.5) +
+  stat_ellipse(aes(group = host.PCA_tools$metadata$Temp_col, fill = host.PCA_tools$metadata$Colony),
+               geom = "polygon", alpha = 0.25, level = 0.95, type = 't') +
+  stat_ellipse(aes(group = host.PCA_tools$metadata$Temp_col, linetype = host.PCA_tools$metadata$Temp_treatment),
+               level = 0.95, type = 't', size = 0.25, colour = 'black') +
+  scale_fill_manual(values = c('#4F7942', '#40826D', '#93C572')) +
+  scale_colour_manual('Coral colony', values = c('#4F7942', '#40826D', '#93C572')) +
+  scale_linetype_manual(values = c('solid','longdash')) +
+  scale_shape_manual(values = c('circle', 'square')) +
+  scale_alpha_manual('C. proliferum relative abundance', values = c(1, 0.25, 0), 
+                     labels = c('Absent', 'Under 50%', 'Over 50%')) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(), 
+        panel.grid.major = element_blank(),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.box = "horizontal",
+        legend.position = 'top',
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = 'bold'),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = 'bold'), 
+        axis.text.y = element_text(size = 12, colour = "black")) +
+  guides(fill = F, linetype = F, 
+         colour = guide_legend(title.position = "top", nrow = 1, override.aes = list(size = 3), order = 1),
+         alpha = guide_legend(title.position = "top", nrow = 1, override.aes = list(size = 3), order = 2),
+         shape = guide_legend(title.position = "top", override.aes = list(size = 3), order = 3)) +
+  labs(shape = 'Temperature treatment')
+host.PCA_tools.biplot
+
+Fig.3A <- host.PCA_tools.biplot
+```
+
+### PERMANOVA
+```{r}
+host.adonis <- set.seed(1234); adonis2(t(host.vsd.mat) ~ Colony * Temp_treatment,
+                                       permutations = 10000,
+                                       data = host_metadata.df,
+                                       method = "bray")
+
+host.adonis_cb <- set.seed(1234); adonis2(t(host.vsd.mat) ~ Chemical_bleaching,
+                                             permutations = 10000,
+                                             data = host_metadata.df,
+                                             method = "bray")
+
+host.adonis_cprol <- set.seed(1234); adonis2(t(host.vsd.mat) ~ Cprol_abundance,
+                                             permutations = 10000,
+                                             data = host_metadata.df,
+                                             method = "bray")
+```
+
+#### Export exploratory PCAs
+```{r}
+#Make sure to run 'RNAseq analysis - photosymbionts.Rmd' first to obtain Fig.3B
+Fig.3 <- ggarrange(Fig.3A,
+                   Fig.3B,
+                   labels = c("A", "B"),
+                   widths = c(1, 1),
+                   ncol = 2)
+Fig.3
+
+ggsave(plot = Fig.3, "./Fig. 3.pdf",
+       path = "./",
+       width = 17.5,
+       height = 7.5,
+       units = 'in',
+       dpi = 300)
+```
+
+### Exploration of transformation approaches
+```{r}
+#Performing a PCA directly with the normalized count matrices would typically result in PCAs dependent mostly on genes with the highest counts (since they show the largest absolute differences between samples).
+#To avoid this, the normalized count matrices can be transformed using two approaches provided by DESeq2:
+# - variance stabilizing transformation (VST)
+# - the regularized-logarithm transformation (rlog)
+
+#Normalized counts are transformed either using vst/rlog
+#Setting blind to TRUE results in a transformation unbiased to sample condition information (i.e., unsupervised transformation)
+host.vsd2 <- vst(host.dds_filt2, blind = T) 
+host.rld <- rlog(host.dds_filt2, blind = T)
+host.dds_filt2 <- estimateSizeFactors(host.dds_filt2)
+host_trfmd.df <- bind_rows(as_data_frame(assay(host.vsd2)[, 1:2]) %>% mutate(transformation = "vst"),
+                           as_data_frame(assay(host.rld)[, 1:2]) %>% mutate(transformation = "rlog"))
+  
+#Scatter plots of transformed counts from two samples
+colnames(host_trfmd.df)[1:2] <- c("x", "y")
+host_lvls <- c("vst", "rlog")
+host_trfmd.df$transformation <- factor(host_trfmd.df$transformation, levels=host_lvls)
+ggplot(host_trfmd.df, aes(x = x, y = y)) + geom_hex(bins = 80) + coord_fixed() + facet_grid( . ~ transformation) 
+
+#Differences between samples (deviation from y=x) will contribute to the distance calculations and the PCA plot
+#Genes with low counts (bottom left-hand corner) seem to be excessively variable on the log scale
+#The vst and rlog compress differences for the low count genes (which provide little information about DGE)
+#As recommended by the DESeq2 vigentte, we proceed with vst transformation as our dataset is greater than n = 30
+```
+
+### Exploration of similarities between samples - GLM-PCA
+```{r}
+#GLM-PCA works with raw count data (here using filtered gene count matrices)
+#GLM-PCA of host gene counts
+host.gpca <- glmpca(counts(host.dds_filt2), L = 2)
+host.gpca_dat <- host.gpca$factors
+host.gpca_dat$Temp_treatment <- host.dds_filt2$Temp_treatment
+host.gpca_dat$Colony <- host.dds_filt2$Colony
+
+ggplot(host.gpca_dat, aes(x = dim1, y = dim2, color = Temp_treatment, shape = Colony)) +
+  geom_point(size =3) + coord_fixed() + ggtitle("Host GLM-PCA")
+```
+
+## DGE analysis and QC
+
+### DGE analysis and QC
+```{r}
+host.dds_unfilt <- DESeqDataSetFromMatrix(countData = host_gene_counts.df,
+                                          colData = host_metadata.df,
+                                          design = ~ Cprol_abundance + Chemical_bleaching + Temp_col)
+
+host.dds_unfilt <- estimateSizeFactors(host.dds_unfilt)
+host.dds_filt3 <- rowSums(counts(host.dds_unfilt, normalized = TRUE) >= 5) >= 1
+table(host.dds_filt3)
+host.dds_filt4 <- host.dds_unfilt[host.dds_filt3]
+
+#Run the differential expression pipeline (use filtered gene count matrices, not normalized ones as this step takes place in the process)
+host.dge <- DESeq(host.dds_filt4)
+
+#Dispersion plots of gene-wise estimates (QC of model fitting)
+plotDispEsts(host.dge)
+#Data should scatter around the fitted curve, with dispersion decreasing as mean expression levels increase
+```
+
+### Temperature contrast (effect of temperature and chemical bleaching on each colony)
+```{r}
+host.dge_res <- DESeq2::results(host.dge)
+metadata(host.dge_res)$filterThreshold
+
+#Set contrasts to be tested in pairwise comparisons
+host_contrast1 <- c("Temp_col", "Elevated_I", "Ambient_I") #The last input is the level used as baseline
+host_contrast2 <- c("Temp_col", "Elevated_J", "Ambient_J")
+host_contrast3 <- c("Temp_col", "Elevated_L", "Ambient_L")
+
+#Build the results tables
+host_res_unshrunken1 <- DESeq2::results(host.dge, contrast = host_contrast1, alpha = 0.05)
+host_res_unshrunken2 <- DESeq2::results(host.dge, contrast = host_contrast2, alpha = 0.05)
+host_res_unshrunken3 <- DESeq2::results(host.dge, contrast = host_contrast3, alpha = 0.05)
+
+summary(host_res_unshrunken1)
+summary(host_res_unshrunken2)
+summary(host_res_unshrunken3)
+
+#Apply LFC shrinkage to the results tables (reduced noise from low gene counts)
+host_res_Ash1 <- lfcShrink(host.dge, contrast = host_contrast1, res= host_res_unshrunken1, type= "ashr") 
+host_res_Ash2 <- lfcShrink(host.dge, contrast = host_contrast2, res= host_res_unshrunken2, type= "ashr")
+host_res_Ash3 <- lfcShrink(host.dge, contrast = host_contrast3, res= host_res_unshrunken3, type= "ashr")
+#Both apeglm and ashr are recommended over normal for LFC shrinkage (https://academic.oup.com/bioinformatics/article/35/12/2084/5159452)
+#Ashr rather than apeglm is used here since it allows the use of contrast as an argument
+
+#Pass the results from the LFC shrinked tables to dfs
+host_res1 <- host_res_Ash1 %>% data.frame() %>% rownames_to_column(var="gene") %>% as_tibble() %>%
+  mutate(contrast = 'Colony_I')
+host_res2 <- host_res_Ash2 %>% data.frame() %>% rownames_to_column(var="gene") %>% as_tibble() %>%
+  mutate(contrast = 'Colony_J')
+host_res3 <- host_res_Ash3 %>% data.frame() %>% rownames_to_column(var="gene") %>% as_tibble() %>%
+  mutate(contrast = 'Colony_L')
+
+mcols(host_res_Ash1, use.names = TRUE) #To extract information regarding the meaning of each column
+
+#Set and apply thresholds to extract LFCs with statistical and meaningful biological relevance (not used in this analysis)
+padj.cutoff <- 0.05
+lfc.cutoff <- 0.58 #Corresponds to a fold change of 1.5 in expression - appears to be a standard value used (explored but not used in the final analysis)
+
+host_signif_genes1 <- host_res1 %>% filter(padj < padj.cutoff) #& abs(log2FoldChange) >= lfc.cutoff)
+host_signif_genes2 <- host_res2 %>% filter(padj < padj.cutoff) #& abs(log2FoldChange) >= lfc.cutoff)
+host_signif_genes3 <- host_res3 %>% filter(padj < padj.cutoff) #& abs(log2FoldChange) >= lfc.cutoff)
+
+host.DEGs <- rbind(host_res1, host_res2) %>%
+  rbind(host_res3)
+```
+
+### Visualization of DE genes
+
+#### Option 1: MA plots displaying LFCs prior to low fold change cutoff
+```{r}
+par(mfrow=c(1,3), mar=c(4,4,2,1))
+xlim <- c(1,1e5); ylim <- c(-5,5)
+DESeq2::plotMA(host_res_Ash1, xlim=xlim, ylim=ylim, main="Colony_I") %>% 
+  abline(h=c(-0.58,0.58), col="red", lwd=2)
+DESeq2::plotMA(host_res_Ash2, xlim=xlim, ylim=ylim, main="Colony_J") %>%
+  abline(h=c(-0.58,0.58), col="red", lwd=2)
+DESeq2::plotMA(host_res_Ash3, xlim=xlim, ylim=ylim, main="Colony_L") %>% 
+  abline(h=c(-0.58,0.58), col="red", lwd=2)
+```
+
+#### Option 2: volcano plots
+```{r}
+host.DEGs_I <- host.DEGs %>%
+  filter(contrast == 'Colony_I') %>%
+  filter(padj < 0.05) %>% #& abs(log2FoldChange) >= lfc.cutoff)
+  column_to_rownames(var = 'gene')
+
+host.DEGs_J <- host.DEGs %>% 
+  filter(contrast == 'Colony_J') %>%
+  filter(padj < 0.05) %>% #& abs(log2FoldChange) >= lfc.cutoff)
+  column_to_rownames(var = 'gene')
+
+host.DEGs_L <- host.DEGs %>%
+  filter(contrast == 'Colony_L') %>%
+  filter(padj < 0.05) %>% #& abs(log2FoldChange) >= lfc.cutoff)
+  column_to_rownames(var = 'gene')
+
+#Define different groups that will be coloured and shaped differently
+group1.col <- c('Colony_I')
+group2.col <- c('Colony_J')
+group3.col <- c('Colony_L')
+
+#Create custom key-value pairs for different GO terms and photosymbiont groups
+keyvals.col1 <- ifelse(host.DEGs_I$contrast %in% group1.col, '#4F7942',
+                       'black')
+keyvals.col2 <- ifelse(host.DEGs_J$contrast %in% group2.col, '#40826D',
+                       'black')
+keyvals.col3 <- ifelse(host.DEGs_L$contrast %in% group3.col, '#93C572',
+                       'black')
+
+keyvals.col1[is.na(keyvals.col1)] <- 'black'
+names(keyvals.col1)[keyvals.col1 == '#4F7942'] <- 'I'
+keyvals.col2[is.na(keyvals.col2)] <- 'black'
+names(keyvals.col2)[keyvals.col2 == '#40826D'] <- 'J'
+keyvals.col3[is.na(keyvals.col3)] <- 'black'
+names(keyvals.col3)[keyvals.col3 == '#93C572'] <- 'L'
+
+#Identify DEGs that are above lgFC of 4 or -4
+host.lfc_cutoff <- 4
+up_I <- rownames(subset(host.DEGs_I, log2FoldChange >= host.lfc_cutoff))
+down_I <- rownames(subset(host.DEGs_I, log2FoldChange <= host.lfc_cutoff * -1))
+up_J <- rownames(subset(host.DEGs_J, log2FoldChange >= host.lfc_cutoff))
+down_J <- rownames(subset(host.DEGs_J, log2FoldChange <= host.lfc_cutoff * -1))
+up_L <- rownames(subset(host.DEGs_L, log2FoldChange >= host.lfc_cutoff))
+down_L <- rownames(subset(host.DEGs_L, log2FoldChange <= host.lfc_cutoff * -1))
+
+#Impute l2FCs in the object to be max host.lfc_cutoff or min -host.lfc_cutoff 
+host.DEGs_I$log2FoldChange <- ifelse(host.DEGs_I$log2FoldChange >= host.lfc_cutoff, host.lfc_cutoff,
+                                     ifelse(host.DEGs_I$log2FoldChange <= host.lfc_cutoff * -1, host.lfc_cutoff * -1,
+                                            host.DEGs_I$log2FoldChange))
+max(host.DEGs_I$log2FoldChange, na.rm = TRUE)
+min(host.DEGs_I$log2FoldChange, na.rm = TRUE)
+
+host.DEGs_J$log2FoldChange <- ifelse(host.DEGs_J$log2FoldChange >= host.lfc_cutoff, host.lfc_cutoff,
+                                     ifelse(host.DEGs_J$log2FoldChange <= host.lfc_cutoff * -1, host.lfc_cutoff * -1,
+                                            host.DEGs_J$log2FoldChange))
+max(host.DEGs_J$log2FoldChange, na.rm = TRUE)
+min(host.DEGs_J$log2FoldChange, na.rm = TRUE)
+
+host.DEGs_L$log2FoldChange <- ifelse(host.DEGs_L$log2FoldChange >= host.lfc_cutoff, host.lfc_cutoff,
+                                     ifelse(host.DEGs_L$log2FoldChange <= host.lfc_cutoff * -1, host.lfc_cutoff * -1,
+                                            host.DEGs_L$log2FoldChange))
+max(host.DEGs_L$log2FoldChange, na.rm = TRUE)
+min(host.DEGs_L$log2FoldChange, na.rm = TRUE)
+
+#Custom shapes for the points
+customshape_I <- rep(19, nrow(host.DEGs_I))
+names(customshape_I) <- rep('Group1', nrow(host.DEGs_I))
+customshape_I[which(rownames(host.DEGs_I) %in% up_I)] <- -9658
+names(customshape_I)[which(rownames(host.DEGs_I) %in% up_I)] <- 'Group2'
+customshape_I[which(rownames(host.DEGs_I) %in% down_I)] <- -9668
+names(customshape_I)[which(rownames(host.DEGs_I) %in% down_I)] <- 'Group3'
+
+customshape_J <- rep(19, nrow(host.DEGs_J))
+names(customshape_J) <- rep('Group1', nrow(host.DEGs_J))
+customshape_J[which(rownames(host.DEGs_J) %in% up_J)] <- -9658
+names(customshape_J)[which(rownames(host.DEGs_J) %in% up_J)] <- 'Group2'
+customshape_J[which(rownames(host.DEGs_J) %in% down_J)] <- -9668
+names(customshape_J)[which(rownames(host.DEGs_J) %in% down_J)] <- 'Group3'
+
+customshape_L <- rep(19, nrow(host.DEGs_L))
+names(customshape_L) <- rep('Group1', nrow(host.DEGs_L))
+customshape_L[which(rownames(host.DEGs_L) %in% up_L)] <- -9658
+names(customshape_L)[which(rownames(host.DEGs_L) %in% up_L)] <- 'Group2'
+customshape_L[which(rownames(host.DEGs_L) %in% down_L)] <- -9668
+names(customshape_L)[which(rownames(host.DEGs_L) %in% down_L)] <- 'Group3'
+
+#Custom sizes for the points
+customsize_I <- rep(1, nrow(host.DEGs_I))
+customsize_I [which(rownames(host.DEGs_I) %in% up_I)] <- 2
+customsize_I [which(rownames(host.DEGs_I) %in% down_I)] <- 2
+
+customsize_J <- rep(1, nrow(host.DEGs_J))
+customsize_J [which(rownames(host.DEGs_J) %in% up_J)] <- 2
+customsize_J [which(rownames(host.DEGs_J) %in% down_J)] <- 2
+
+customsize_L <- rep(1, nrow(host.DEGs_L))
+customsize_L [which(rownames(host.DEGs_L) %in% up_L)] <- 2
+customsize_L [which(rownames(host.DEGs_L) %in% down_L)] <- 2
+
+#Volcano plots
+host.DEGS.volc_plot_I <- EnhancedVolcano(host.DEGs_I, lab = NA,
+                                         x = 'log2FoldChange', y = 'padj',
+                                         xlim = c(-4, 4), #ylim = c(0, -log10(10e-52)),
+                                         title = '', subtitle = 'Colony I',
+                                         caption = paste0(nrow(host.DEGs_I), " DEGs"),
+                                         legendPosition = "none", legendLabSize = 8, legendIconSize = 2,
+                                         pCutoff = 0.05, FCcutoff = 0.58,
+                                         cutoffLineWidth = 0.25, cutoffLineCol = "black",
+                                         cutoffLineType = "dashed",
+                                         colCustom = keyvals.col1,
+                                         shapeCustom = customshape_I,
+                                         pointSize = customsize_I,
+                                         gridlines.minor = F, gridlines.major = F,
+                                         labSize = 3.0, axisLabSize = 14, colAlpha = 1) + 
+  theme(plot.margin=unit(c(-1,-0.25,-0.95,0), "cm")) +
+  guides(colour = F)
+
+host.DEGS.volc_plot_J <- EnhancedVolcano(host.DEGs_J, lab = NA,
+                                         x = 'log2FoldChange', y = 'padj',
+                                         xlim = c(-4, 4), #ylim = c(0, -log10(10e-52)),
+                                         title = '', subtitle = 'Colony J', 
+                                         caption = paste0(nrow(host.DEGs_J), " DEGs"),
+                                         legendPosition = "none", legendLabSize = 8, legendIconSize = 2,
+                                         pCutoff = 0.05, FCcutoff = 0.58,
+                                         cutoffLineWidth = 0.25, cutoffLineCol = "black",
+                                         cutoffLineType = "dashed",
+                                         colCustom = keyvals.col2,
+                                         shapeCustom = customshape_J,
+                                         pointSize = customsize_J,
+                                         gridlines.minor = F, gridlines.major = F,
+                                         labSize = 3.0, axisLabSize = 14, colAlpha = 1) + 
+  theme(plot.margin=unit(c(-1,-0.25,-0.95,0), "cm")) +
+  guides(colour = F)
+
+host.DEGS.volc_plot_L <- EnhancedVolcano(host.DEGs_L, lab = NA,
+                                         x = 'log2FoldChange', y = 'padj',
+                                         xlim = c(-4, 4), #ylim = c(0, -log10(10e-52)),
+                                         title = '', subtitle = 'Colony L', 
+                                         caption = paste0(nrow(host.DEGs_L), " DEGs"),
+                                         legendPosition = "none", legendLabSize = 8, legendIconSize = 2,
+                                         pCutoff = 0.05, FCcutoff = 0.58,
+                                         cutoffLineWidth = 0.25, cutoffLineCol = "black", 
+                                         cutoffLineType = "dashed",
+                                         colCustom = keyvals.col3,
+                                         shapeCustom = customshape_L,
+                                         pointSize = customsize_L,
+                                         gridlines.minor = F, gridlines.major = F,
+                                         labSize = 3.0, axisLabSize = 14, colAlpha = 1) + 
+  theme(plot.margin=unit(c(-1,-0.25,-0.95,0), "cm")) +
+  guides(colour = F)
+
+host.DEG.volc_plots <- ggarrange(host.DEGS.volc_plot_I + rremove('ylab') + rremove('xlab'),
+                                 host.DEGS.volc_plot_J + rremove('ylab') + rremove('xlab'),
+                                 host.DEGS.volc_plot_L + rremove('ylab') + rremove('xlab'),
+                                 #common.legend = T,
+                                 #legend = "top",
+                                 heights = c(1, 1, 1),
+                                 align = 'hv',
+                                 ncol = 3)
+host.DEG.volc_plots
+
+host.DEG.volc_plots_annot <- annotate_figure(host.DEG.volc_plots,
+                                            bottom = text_grob(bquote(bold(~Log[2]~"Fold Change")),
+                                                               color = "black", face = "bold", size = 14),
+                                            left = text_grob(bquote(bold(~-Log[10] ~ italic(P))),
+                                                             color= "black",face = "bold",size = 14,rot = 90))
+host.DEG.volc_plots_annot
+
+Fig.4B <- host.DEG.volc_plots_annot
+```
+
+#### Option 3: barplot of expression levels of DEGs - barplot
+```{r}
+#Calculate mean expression levels for down- and up-regulated DEGs
+host.DEGs_down <- host.DEGs %>%
+  group_by(contrast) %>%
+  filter(padj < 0.05) %>%
+  filter(log2FoldChange < 0) %>%
+  mutate(mean_l2fc = mean(log2FoldChange)) %>%
+  mutate(se_l2fc = sd(log2FoldChange)/sqrt(length((log2FoldChange)))) #%>%
+  #mutate(direction = '-') %>%
+  #select(contrast, mean_l2fc, se_l2fc, direction) %>%
+  #distinct()
+
+host.DEGs_up <- host.DEGs %>%
+  group_by(contrast) %>%
+  filter(padj < 0.05) %>%
+  filter(log2FoldChange > 0) %>%
+  mutate(mean_l2fc = mean(log2FoldChange)) %>%
+  mutate(se_l2fc = sd(log2FoldChange)/sqrt(length((log2FoldChange)))) #%>%
+  #mutate(direction = '+') %>%
+  #select(contrast, mean_l2fc, se_l2fc, direction) %>%
+  #distinct()
+
+#Check for significant differences between photosymbiont communities (using Tukey’s HSD)
+tukey_hsd.host_lfc_down <- aov(log2FoldChange ~ contrast, data = host.DEGs_down) %>% tukey_hsd()
+tukey_hsd.host_lfc_up <- aov(log2FoldChange ~ contrast, data = host.DEGs_up) %>% tukey_hsd()
+
+#Plot barplot with mean expression levels
+host.DEGs_barplot <- rbind(host.DEGs_down, host.DEGs_up) %>%
+  mutate(contrast = factor(contrast, levels = c("Colony_I", "Colony_J", "Colony_L"))) %>%
+  ggplot() +
+  stat_pvalue_manual(tukey_hsd.host_lfc_up, label = "p.adj.signif",  tip.length = 0, coord.flip = TRUE,
+                     y.position = c(0.8, 0.95, 0.875)) +
+  stat_pvalue_manual(tukey_hsd.host_lfc_down, label = "p.adj.signif",  tip.length = 0, coord.flip = TRUE,
+                     vjust = -1, angle = 90,
+                     y.position = c(-0.8, -0.95, -0.875)) +
+  geom_bar(aes(x = contrast, y = mean_l2fc, fill = contrast),
+               stat = 'identity', position = position_dodge(), width = 0.5) +
+  geom_linerange(aes(x = contrast, ymin = mean_l2fc - se_l2fc, ymax = mean_l2fc + se_l2fc),
+                 stat = 'identity', position = position_dodge(0.5), size = 3) +
+  geom_hline(aes(yintercept = 0), linetype = 'dashed', size = 0.5) +
+  scale_fill_manual(values = c('#4F7942', '#40826D', '#93C572')) +
+  scale_y_continuous(bquote(bold(Mean~Log[2]~"Fold Change")), limits = c(-1,1)) +
+  scale_x_discrete('Coral colony', expand = c(0, 0), 
+                   labels = c('I', 'J', 'L')) +
+  coord_flip() +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = 'top',
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = 'bold'),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = 'bold'), 
+        axis.text.y = element_text(size = 12, colour = "black")) +
+  guides(fill = F)
+host.DEGs_barplot
+
+Fig.4C <- host.DEGs_barplot
+```
+
+#### Option 4: venn diagram of to identify unique DEGs
+```{r}
+#Identify how many down- and up-regulated DEGs are shared 
+host.DEGs_up_down <- host.DEGs %>%
+  group_by(contrast) %>%
+  filter(padj < 0.05) %>%
+  dplyr::select(contrast, gene, log2FoldChange, padj) %>%
+  mutate(direction = case_when(log2FoldChange < 0 ~ '-',
+                               log2FoldChange > 0 ~ '+')) %>%
+  dplyr::select(contrast, direction) %>%
+  group_by(contrast, direction) %>%
+  dplyr::count(contrast, direction)
+
+#Venn diagram 
+host.venn <- venn.diagram(x = list(host_signif_genes1$gene, host_signif_genes2$gene, host_signif_genes3$gene),
+  category.names = c("Colony I", "Colony J", "Colony L"),
+  filename = NULL, #Add filename here to save venn diagram
+  disable.logging = TRUE,
+  lwd = 2,
+  lty = 1,
+  col = c('#4F7942', '#40826D', '#93C572'),
+  fill = c(alpha('#4F7942', 0.5), alpha('#40826D', 0.5), alpha('#93C572', 0.5)),
+  cex = 1.25,
+  fontface = "bold",
+  cat.col = c("#4F7942", '#40826D', '#93C572'),
+  cat.cex = 1.25,
+  cat.fontface = "bold",
+  cat.default.pos = "outer",
+  cat.pos = c(-25, 25, 135),
+  cat.dist = c(0.06, 0.06, 0.1),
+  rotation = 1)
+grid.newpage()
+grid.draw(host.venn)
+
+Fig.4D <- host.venn
+```
+
+
+### Visualisation of gene expression level for host DEGs
+
+### Subset gene count matrix with DEGs 
+```{r}
+#Filter for significant DEGs
+host.DEGs_signif <- host.DEGs %>% 
+  filter(padj < 0.05) %>% #& abs(log2FoldChange) >= lfc.cutoff) %>% 
+  dplyr::select(gene) %>% 
+  distinct() %>% 
+  pull()
+
+#Keep only genes that are differentially expressed
+host_gene_counts.df.DEGs <- host_gene_counts.df[host.DEGs_signif,]
+```
+
+### VST transform gene counts (includes count normalisation) and scale to obtain gene z-scores
+```{r}
+host.dds.DEGs <- DESeqDataSetFromMatrix(countData = host_gene_counts.df.DEGs,
+                                       colData = host_metadata.df,
+                                       design = ~ Cprol_abundance + Chemical_bleaching + Temp_treatment + Colony + Temp_treatment:Colony)
+
+host.vsd_DEGs <- vst(host.dds.DEGs, blind=FALSE)
+host.vsd_DEGs.mat <- assay(host.vsd_DEGs) 
+host.vsd_DEGs_scaled <- t(scale(t(host.vsd_DEGs.mat))) 
+host.vsd_DEGs_scaled2 <- host.vsd_DEGs_scaled %>%
+  melt() %>%
+  rename(gene = Var1, SampleName = Var2, count_norm = value) %>%
+  left_join(., dplyr::select(host_metadata.df, 
+                             c(SampleName, Temp_treatment, Cprol_abundance, Colony, Chemical_bleaching)))
+```
+
+### Density plot of gene z-scores under each temperature treatment
+```{r}
+host.vsd_DEGs_scaled2$Colony <- factor(host.vsd_DEGs_scaled2$Colony,
+                                       levels = c("I", "J", "L"))
+
+host.DEG_expression.ridge_plot <- host.vsd_DEGs_scaled2 %>%
+  ggplot(aes(x = count_norm, y = Colony, fill = Temp_treatment)) +
+  geom_vline(aes(xintercept = 0), linetype = 'dashed', size = 0.25) +
+  geom_density_ridges(alpha = 0.5, size = 0.25, scale = 0.95) +
+  scale_fill_manual('Temperature treatment', values = c('#2171B5', '#CB181D')) +
+  scale_x_continuous('Gene Z-score', expand = c(0, 0), limits = c(-4, 4), breaks = -4:4*2) +
+  scale_y_discrete('Coral colony', expand = c(0, 0)) + 
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = 'top',
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = 'bold'),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = 'bold'), 
+        axis.text.y = element_text(size = 12, colour = "black"))
+host.DEG_expression.ridge_plot
+
+host.DEG_expression.barplot <- host.vsd_DEGs_scaled2 %>%
+  group_by(Temp_treatment, Colony) %>%
+  mutate(abs_zscore = abs(count_norm)) %>%
+  mutate(mean_zscore = mean(abs_zscore)) %>%
+  mutate(se_zscore = sd(abs_zscore)/sqrt(length((abs_zscore)))) %>%
+  ungroup() %>%
+  dplyr::select(-c(gene, count_norm, abs_zscore)) %>%
+  distinct() %>%
+  ggplot(aes(x = Colony, fill = Temp_treatment)) +
+  geom_bar(aes(y = mean_zscore), stat = 'identity', position = position_dodge(), width = 0.75) +
+  geom_linerange(aes(ymin = mean_zscore - se_zscore, ymax = mean_zscore + se_zscore), stat = 'identity',
+                 position = position_dodge(0.75), size = 3) +
+  scale_fill_manual('Temperature treatment', values = c('#2171B5', '#CB181D')) +
+  scale_y_continuous('Mean absolute gene Z-score', expand = c(0,0)) +
+  scale_x_discrete('Coral colony', expand = c(0, 0)) +
+  coord_flip() +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = 'top',
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = 'bold'),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = 'bold'), 
+        axis.text.y = element_text(size = 12, colour = "black"))
+host.DEG_expression.barplot
+```
+
+### Heatmap of gene z-scores
+```{r}
+myCol <- colorRampPalette(c('#005AB5', 'white', '#DC3220'))(100)
+myBreaks <- seq(-3, 3, length.out = 100)
+
+host_ann <- data.frame(
+  Temperature = host_metadata.df$Temp_treatment,
+  Coral_colony = host_metadata.df$Colony,
+  Chemical_bleaching = host_metadata.df$Chemical_bleaching,
+  stringsAsFactors = FALSE)
+
+#Create the colour mapping
+host_colours <- list(
+  Temperature = c('Ambient' = '#2171B5', 'Elevated' = '#CB181D'),
+  Coral_colony = c('I' = '#4F7942', 'J' = '#40826D', 'L' = '#93C572'),
+  Chemical_bleaching = c('TRUE' = 'grey', 'FALSE' = 'white'))
+
+#Create the ComplexHeatmap annotation object
+host_colAnn <- HeatmapAnnotation(
+  df = host_ann,
+  which = 'col', #Col (samples) or row (gene) annotation
+  na_col = 'white', #Default colour for any NA values in the annotation data-frame (host_ann)
+  col = host_colours,
+  annotation_height = 0.6,
+  annotation_width = unit(1, 'cm'),
+  gap = unit(1, 'mm'),
+  show_annotation_name = FALSE,
+  annotation_legend_param = list(
+    Temperature = list(
+      nrow = 2, #Number of rows across which the legend will be arranged
+      title = 'Temperature',
+      title_position = 'topleft',
+      legend_direction = 'vertical',
+      title_gp = gpar(fontsize = 12, fontface = 'bold'),
+      labels_gp = gpar(fontsize = 12, fontface = 'plain'),
+      labels = c("Ambient", "Elevated")),
+    Coral_colony = list(
+      nrow = 3,
+      title = 'Coral colony',
+      title_position = 'topleft',
+      legend_direction = 'vertical',
+      title_gp = gpar(fontsize = 12, fontface = 'bold'),
+      labels_gp = gpar(fontsize = 12, fontface = 'plain'),
+      labels = c("I", "J", "L")),
+    Chemical_bleaching = list(
+      nrow = 2,
+      title = 'Chemically bleached?',
+      title_position = 'topleft',
+      legend_direction = 'vertical',
+      title_gp = gpar(fontsize = 12, fontface = 'bold'),
+      labels_gp = gpar(fontsize = 12, fontface = 'plain'),
+      at = c("TRUE", "FALSE"),
+      labels = c("True", "False"))))
+  
+host_boxplotCol <- HeatmapAnnotation(
+  show_annotation_name = FALSE,
+  boxplot = anno_boxplot(
+    host.vsd_DEGs_scaled,
+    border = FALSE,
+    gp = gpar(fill = '#CCCCCC'),
+    pch = '.',
+    size = unit(2, 'mm'),
+    axis = TRUE,
+    axis_param = list(
+      gp = gpar(fontsize = 12),
+      side = 'left')),
+  annotation_width = unit(c(2.0), 'cm'),
+  which = 'col')
+
+pamClusters <- cluster::pam(host.vsd_DEGs_scaled, k = 3) #Pre-select k = 3 centers
+pamClusters$clustering <- paste0('Cluster ', pamClusters$clustering)
+
+#Fix order of the clusters to have 1 to 4, top to bottom
+pamClusters$clustering <- factor(pamClusters$clustering,
+                                 levels = c('Cluster 1', 'Cluster 2', 'Cluster 3'))
+host.hmap <- Heatmap(host.vsd_DEGs_scaled,
+    # split the genes / rows according to the PAM clusters
+    split = pamClusters$clustering,
+    cluster_row_slices = FALSE,
+    name = 'Gene Z-score',
+    col = colorRamp2(myBreaks, myCol),
+    # parameters for the colour-bar that represents gradient of expression
+    heatmap_legend_param = list(
+      color_bar = 'continuous',
+      legend_direction = 'vertical',
+      legend_width = unit(4, 'cm'),
+      legend_height = unit(4.0, 'cm'),
+      title_position = 'leftcenter-rot',
+      title_gp=gpar(fontsize = 14, fontface = 'bold'),
+      labels_gp=gpar(fontsize = 12, fontface = 'plain')),
+    # row (gene) parameters
+    cluster_rows = TRUE,
+    show_row_dend = TRUE,
+    row_title = 'Differentially expressed genes (DEGs)',
+    row_title_side = 'left',
+    row_title_gp = gpar(fontsize = 14,  fontface = 'bold'),
+    row_title_rot = 90,
+    show_row_names = FALSE,
+    row_names_gp = gpar(fontsize = 12, fontface = 'plain'),
+    row_names_side = 'left',
+    row_dend_width = unit(15,'mm'),
+    # column (sample) parameters
+    cluster_columns = TRUE,
+    show_column_dend = TRUE,
+    column_title = '',
+    column_title_side = 'bottom',
+    column_title_gp = gpar(fontsize = 14, fontface = 'bold'),
+    column_title_rot = 0,
+    show_column_names = FALSE,
+    column_names_gp = gpar(fontsize = 12, fontface = 'plain'),
+    column_names_max_height = unit(10, 'cm'),
+    column_dend_height = unit(15,'mm'),
+    # cluster methods for rows and columns
+    clustering_distance_columns = function(x) as.dist(1 - cor(t(x))),
+    clustering_method_columns = 'ward.D2',
+    clustering_distance_rows = function(x) as.dist(1 - cor(t(x))),
+    clustering_method_rows = 'ward.D2',
+    # specify top and bottom annotations
+    top_annotation = host_colAnn,
+    bottom_annotation = host_boxplotCol,
+    width = unit(15, "cm"))
+
+host.DEGs_hmap = grid.grabExpr(draw(host.hmap,
+                                    heatmap_legend_side = 'left',
+                                    annotation_legend_side = 'right',
+                                    row_sub_title_side = 'left',
+                                    align_heatmap_legend = 'global_center',
+                                    align_annotation_legend = 'global_center',
+                                    column_title = "",
+                                    column_title_gp = gpar(fontsize = 14, fontface = 'bold')))
+host.DEGs_hmap
+is.grob(host.DEGs_hmap)
+
+#Heatmaps drawn thanks to tutorial from: https://github.com/kevinblighe/E-MTAB-6141
+```
+
+## Assemble plots from DGE analysis for export
+```{r}
+host_DEGs.panel1 <- cowplot::plot_grid(Fig.4B,
+                                 Fig.4C,
+                                 Fig.4D,
+                                 labels = c("B", "C", "D"),
+                                 ncol = 1, align = "v",
+                                 axis = "b",
+                                 rel_heights = c(1, 0.5, 0.6),
+                                 rel_widths = c(1, 0.75, 0.75))
+host_DEGs.panel1
+
+host_DEGs.panel2 <- cowplot::plot_grid(host.DEGs_hmap,
+                              host_DEGs.panel1,
+                              labels = c("A", ""),
+                              ncol = 2, align = "v",
+                              axis = "b",
+                              rel_heights = c(1, 1),
+                              rel_widths = c(1, 0.7))
+host_DEGs.panel2
+```
+
+### Save DGE analysis plots of interest
+```{r}
+ggsave(plot = host_DEGs.panel2, "./Fig. 4.pdf", 
+       path = "./",
+       width = 16,
+       height = 10,
+       units = 'in',
+       dpi = 300, device=cairo_pdf)
+
+png(file = "./Heatmap host DEGs.png",
+    width = 10,
+    height = 7.5,
+    units = "in",
+    res = 1200)
+draw(host.hmap,
+     heatmap_legend_side = 'left',
+     annotation_legend_side = 'right',
+     row_sub_title_side = 'left',
+     align_heatmap_legend = 'global_center',
+     align_annotation_legend = 'global_center',
+     column_title = "Expression levels of host DEGs",
+     column_title_gp = gpar(fontsize = 14, fontface = 'bold'))
+dev.off()
+```
+
+## Over-representation analysis
+
+### Import exon lengths and gene ontology (GO) terms for P. daedalea
+```{r}
+#Import exon lengths of P. daedalea
+pdae_transcript.length <- read_xlsx("./RNAseq dataset.xlsx", sheet = 6) %>%
+  #rbind(names(.), .) %>%
+  #rename(exon_id = 1 , start = 2, end = 3, 'exon_#' = 4, length = 5) %>%
+  #mutate(length = as.numeric(length)) %>%
+  group_by(exon_id) %>%
+  mutate(transcript_length = sum(length)) %>%
+  dplyr::select(exon_id, transcript_length) %>%
+  rename('gene' = 1, 'length' = 2) %>%
+  distinct()
+
+#Import gene counts
+host_gene_counts.df2 <-host_gene_counts.df %>%
+  rowMeans() %>%
+  as.data.frame() %>%
+  rownames_to_column(var = 'gene') %>%
+  rename('length' = 2)
+
+#Import annotated genes with GO terms
+pdae_gene.annot <- read_xlsx("./RNAseq dataset.xlsx", sheet = 8) %>%
+  rename('gene' = 1, 'source' = 2, 'hit_accession' = 3, 'hit_description' = 4, 'GO_ID' = 13)
+```
+
+### Prepare lists of background genes and DEGs - upregulated and downregulated DEGs analysed seperately
+```{r}
+#List of background genes based on all genes assayed (first considered but then not used in analysis)
+host_ALL.genes_assayed <- host_gene_counts.df %>%
+  rownames_to_column(var = 'gene') %>%
+  dplyr::select(gene) %>%
+  mutate_all(trimws)
+host_ALL.genes_assayed_list <- host_ALL.genes_assayed[['gene']]
+
+#Run this analysis once with upregulated DEGs then repeat with downregulated DEGs
+#List of background genes resulting from the DGE analysis (this means genes with low counts are already filtered out)
+host_ALL.DGE_assayed <- host.DEGs %>%
+  filter(log2FoldChange > 0) %>%
+  #filter(log2FoldChange < 0) %>%
+  dplyr::select(gene) %>%
+  distinct() %>%
+  mutate_all(trimws)
+host_ALL.DGE_assayed_list <- host_ALL.DGE_assayed[['gene']]
+
+#List of DEGs for each contrast (filter for significant genes i.e., padj < 0.05)
+host_DEGs_assayed.1 <- host.DEGs %>%
+  filter(log2FoldChange > 0) %>%
+  #filter(log2FoldChange < 0) %>%
+  filter(contrast == 'Colony_I') %>%
+  filter(padj < 0.05) %>%
+  dplyr::select(gene) %>%
+  distinct() %>%
+  mutate_all(trimws)
+host_DEGs_assayed_list.1 <- host_DEGs_assayed.1[['gene']]
+
+host_DEGs_assayed.2 <- host.DEGs %>%
+  filter(log2FoldChange > 0) %>%
+  #filter(log2FoldChange < 0) %>%
+  filter(contrast == 'Colony_J') %>%
+  filter(padj < 0.05) %>%
+  dplyr::select(gene) %>%
+  distinct() %>%
+  mutate_all(trimws)
+host_DEGs_assayed_list.2 <- host_DEGs_assayed.2[['gene']]
+
+host_DEGs_assayed.3 <- host.DEGs %>%
+  filter(log2FoldChange > 0) %>%
+  #filter(log2FoldChange < 0) %>%
+  filter(contrast == 'Colony_L') %>%
+  filter(padj < 0.05) %>%
+  dplyr::select(gene) %>%
+  distinct() %>%
+  mutate_all(trimws)
+host_DEGs_assayed_list.3 <- host_DEGs_assayed.3[['gene']]
+```
+
+### Calculate probability weighting function using goseq
+```{r}
+#Construct a new vector that adds a 0 next to every gene that is not in the DEG list and a 1 next to every gene that is in the DEG list
+host_gene.vector.1 = as.integer(host_ALL.DGE_assayed_list %in% host_DEGs_assayed_list.1)
+names(host_gene.vector.1) = host_ALL.DGE_assayed_list
+
+host_gene.vector.2 = as.integer(host_ALL.DGE_assayed_list %in% host_DEGs_assayed_list.2)
+names(host_gene.vector.2) = host_ALL.DGE_assayed_list
+
+host_gene.vector.3 = as.integer(host_ALL.DGE_assayed_list %in% host_DEGs_assayed_list.3)
+names(host_gene.vector.3) = host_ALL.DGE_assayed_list
+
+#Ensure that the list of transcript lengths matches host_gene.vector
+pdae_transcript.length.1 <- pdae_transcript.length[pdae_transcript.length$gene %in% host_ALL.DGE_assayed$gene, ]
+gene_length_pdae_list.1 <- deframe(pdae_transcript.length.1)
+
+pdae_transcript.length.2 <- pdae_transcript.length[pdae_transcript.length$gene %in% host_ALL.DGE_assayed$gene, ]
+gene_length_pdae_list.2 <- deframe(pdae_transcript.length.2)
+
+pdae_transcript.length.3 <- pdae_transcript.length[pdae_transcript.length$gene %in% host_ALL.DGE_assayed$gene, ]
+gene_length_pdae_list.3 <- deframe(pdae_transcript.length.3)
+
+#Ensure order of vectors are the same and prepare vectors for pwf() function 
+host_gene.vector.1 <- host_gene.vector.1[order(names(host_gene.vector.1))]
+gene_length_pdae_list.1 <- gene_length_pdae_list.1[order(names(gene_length_pdae_list.1))]
+gene_length_pdae_list.1 <- unname(gene_length_pdae_list.1)
+gene_length_pdae_list.1 <- as.integer(gene_length_pdae_list.1)
+
+host_gene.vector.2 <- host_gene.vector.2[order(names(host_gene.vector.2))]
+gene_length_pdae_list.2 <- gene_length_pdae_list.2[order(names(gene_length_pdae_list.2))]
+gene_length_pdae_list.2 <- unname(gene_length_pdae_list.2)
+gene_length_pdae_list.2 <- as.integer(gene_length_pdae_list.2)
+
+host_gene.vector.3 <- host_gene.vector.3[order(names(host_gene.vector.3))]
+gene_length_pdae_list.3 <- gene_length_pdae_list.3[order(names(gene_length_pdae_list.3))]
+gene_length_pdae_list.3 <- unname(gene_length_pdae_list.3)
+gene_length_pdae_list.3 <- as.integer(gene_length_pdae_list.3)
+
+#Weigh the gene vector by lengths of the transcripts
+host_pwf.1 = nullp(host_gene.vector.1, bias.data = gene_length_pdae_list.1)
+host_pwf.2 = nullp(host_gene.vector.2, bias.data = gene_length_pdae_list.2)
+host_pwf.3 = nullp(host_gene.vector.3, bias.data = gene_length_pdae_list.3)
+```
+
+### Get GO terms and carry out over-representation analysis
+```{r}
+#Prepare list of GO terms for each gene
+host_GO.df <- pdae_gene.annot %>% dplyr::select(gene, GO_ID) %>% separate_rows(GO_ID, sep = ',')
+host_GO.list <- split(host_GO.df$GO_ID, host_GO.df$gene)
+
+#Carry out go GO enrichment and depletion (using goseq)
+host_goseq.df1 = goseq(host_pwf.1, gene2cat = host_GO.list, method = "Wallenius", use_genes_without_cat = F) %>% mutate(contrast = 'Colony_I')
+host_goseq.df2 = goseq(host_pwf.2, gene2cat = host_GO.list, method = "Wallenius", use_genes_without_cat = F) %>% mutate(contrast = 'Colony_J')
+host_goseq.df3 = goseq(host_pwf.3, gene2cat = host_GO.list, method = "Wallenius", use_genes_without_cat = F) %>% mutate(contrast = 'Colony_L')
+```
+
+### Pass gene IDs to enriched/depleted GO terms
+```{r}
+#Pass IDs of DEGs to output from enrichment (gene column = gene IDs of numInCat)
+host_GO_DEG.df <- host_GO.df %>% filter(gene %in% host_ALL.DGE_assayed$gene)
+
+GO_host.df1 <- aggregate(gene ~ GO_ID, host_GO_DEG.df, FUN = function(x) paste(unique(x), collapse = "; ")) %>% rename('category' = 1)
+GO_host.df2 <- aggregate(gene ~ GO_ID, host_GO_DEG.df, FUN = function(x) paste(unique(x), collapse = "; ")) %>% rename('category' = 1)
+GO_host.df3 <- aggregate(gene ~ GO_ID, host_GO_DEG.df, FUN = function(x) paste(unique(x), collapse = "; ")) %>% rename('category' = 1)
+
+host_goseq.df1 <- left_join(host_goseq.df1, GO_host.df1, by = 'category')
+host_goseq.df2 <- left_join(host_goseq.df2, GO_host.df2, by = 'category')
+host_goseq.df3 <- left_join(host_goseq.df3, GO_host.df3, by = 'category')
+```
+
+### Keep statistically significant GO terms and check the GO IDs for missing annotatations 
+```{r}
+host_enriched_signif.1 <- host_goseq.df1 %>%
+  mutate(padj_BH = p.adjust(over_represented_pvalue, method="BH")) %>%
+  filter(over_represented_pvalue < 0.05) %>%
+  filter(numDEInCat >= 10) %>%
+  mutate(signif = case_when(over_represented_pvalue & padj_BH < 0.05 ~ 'yes',
+                            TRUE ~ 'no')) %>%
+  mutate(pval = over_represented_pvalue, direction = 'enriched')
+
+host_enriched_signif.2 <- host_goseq.df2 %>%
+  mutate(padj_BH = p.adjust(over_represented_pvalue, method="BH")) %>%
+  filter(over_represented_pvalue < 0.05) %>% 
+  filter(numDEInCat >= 10) %>%
+  mutate(signif = case_when(over_represented_pvalue & padj_BH < 0.05 ~ 'yes',
+                            TRUE ~ 'no')) %>%
+  mutate(pval = over_represented_pvalue, direction = 'enriched')
+
+host_enriched_signif.3 <- host_goseq.df3 %>%
+  mutate(padj_BH = p.adjust(over_represented_pvalue, method="BH")) %>%
+  filter(over_represented_pvalue < 0.05) %>% 
+  filter(numDEInCat >= 10) %>%
+  mutate(signif = case_when(over_represented_pvalue & padj_BH < 0.05 ~ 'yes',
+                            TRUE ~ 'no')) %>%
+  mutate(pval = over_represented_pvalue, direction = 'enriched')
+
+host_depleted_signif.1 <- host_goseq.df1 %>%
+  mutate(padj_BH = p.adjust(under_represented_pvalue, method="BH")) %>%
+  filter(under_represented_pvalue < 0.05) %>% 
+  filter(numDEInCat >= 10) %>%
+  mutate(signif = case_when(under_represented_pvalue & padj_BH < 0.05 ~ 'yes',
+                            TRUE ~ 'no')) %>%
+  mutate(pval = under_represented_pvalue, direction = 'depleted')
+
+host_depleted_signif.2 <- host_goseq.df2 %>%
+  mutate(padj_BH = p.adjust(under_represented_pvalue, method="BH")) %>%
+  filter(under_represented_pvalue < 0.05) %>% 
+  filter(numDEInCat >= 10) %>%
+  mutate(signif = case_when(under_represented_pvalue & padj_BH < 0.05 ~ 'yes',
+                            TRUE ~ 'no')) %>%
+  mutate(pval = under_represented_pvalue, direction = 'depleted')
+
+host_depleted_signif.3 <- host_goseq.df3 %>% 
+  mutate(padj_BH = p.adjust(under_represented_pvalue, method="BH")) %>%
+  filter(under_represented_pvalue < 0.05) %>% 
+  filter(numDEInCat >= 10) %>%
+  mutate(signif = case_when(under_represented_pvalue & padj_BH < 0.05 ~ 'yes',
+                            TRUE ~ 'no')) %>%
+  mutate(pval = under_represented_pvalue, direction = 'depleted')
+
+host_GO_signif <- rbind(host_enriched_signif.1, host_enriched_signif.2) %>%
+  rbind(host_enriched_signif.3) %>%
+  rbind(host_depleted_signif.1) %>%
+  rbind(host_depleted_signif.2) %>%
+  rbind(host_depleted_signif.3) %>%
+  dplyr::select(!c(over_represented_pvalue, under_represented_pvalue)) 
+```
+
+### Fetch missing annotations for GO terms from: https://www.ebi.ac.uk/QuickGO/term
+```{r}
+#Some annotations seem to be missing if the GO term is obsolete or a secondary ID
+#Obsolete GO terms will be filtered out
+host_GO_signif_annot <- host_GO_signif %>%
+  mutate(term = case_when(str_detect(category, 'GO:0044432') ~ 'obsolete endoplasmic reticulum part',
+                          str_detect(category, 'GO:0018298') ~ 'obsolete protein-chromophore linkage',
+                          str_detect(category, 'GO:0044711') ~ 'biosynthetic process',
+                          str_detect(category, 'GO:0044710') ~ 'metabolic process',
+                          str_detect(category, 'GO:0001071') ~ 'DNA-binding transcription factor activity',
+                          str_detect(category, 'GO:0044699') ~ 'biological_process',
+                          str_detect(category, 'GO:0044444') ~ 'obsolete cytoplasmic part',
+                          str_detect(category, 'GO:0044445') ~ 'obsolete cytosolic part',
+                          str_detect(category, 'GO:0044702') ~ 'reproductive process',
+                          str_detect(category, 'GO:0044431') ~ 'obsolete Golgi apparatus part',
+                          str_detect(category, 'GO:0044421') ~ 'obsolete extracellular region part',
+                          str_detect(category, 'GO:0000975') ~ 'transcription cis-regulatory region binding',
+                          str_detect(category, 'GO:0044212') ~ 'transcription cis-regulatory region binding',
+                          str_detect(category, 'GO:0006928') ~ 'obsolete movement of cell or subcellular component',
+                          str_detect(category, 'GO:0016246') ~ 'regulatory ncRNA-mediated post-transcriptional gene silencing',
+                          str_detect(category, 'GO:0044441') ~ 'obsolete ciliary part',
+                          str_detect(category, 'GO:0006928') ~ 'obsolete movement of cell or subcellular component',
+                          str_detect(category, 'GO:0055114') ~ 'obsolete oxidation-reduction process',
+                          str_detect(category, 'GO:0044463') ~ 'obsolete cell projection part',
+                          str_detect(category, 'GO:1902589') ~ 'organelle organization',
+                          str_detect(category, 'GO:0044430') ~ 'obsolete cytoskeletal part',
+                          str_detect(category, 'GO:0044702') ~ 'reproductive process',
+                          str_detect(category, 'GO:0005578') ~ 'extracellular matrix',
+                          str_detect(category, 'GO:0044420') ~ 'obsolete extracellular matrix component',
+                          str_detect(category, 'GO:0044707') ~ 'multicellular organismal process',
+                          str_detect(category, 'GO:0070011') ~ 'peptidase activity',
+                          str_detect(category, 'GO:0022610') ~ 'obsolete biological adhesion',
+                          str_detect(category, 'GO:0044767') ~ 'developmental process',
+                          str_detect(category, 'GO:0044425') ~ 'obsolete membrane part',
+                          str_detect(category, 'GO:0051270') ~ 'obsolete regulation of cellular component movement',
+                          str_detect(category, 'GO:0001012') ~ 'RNA polymerase II transcription regulatory region sequence-specific DNA binding',
+                          str_detect(category, 'GO:0051272') ~ 'obsolete positive regulation of cellular component movement',
+                          str_detect(category, 'GO:0000975') ~ 'transcription cis-regulatory region binding',
+                          str_detect(category, 'GO:0044212') ~ 'transcription cis-regulatory region binding',
+                          str_detect(category, 'GO:0001077') ~ 'DNA-binding transcription activator activity, RNA polymerase II-specific',
+                          str_detect(category, 'GO:0000982') ~ 'DNA-binding transcription factor activity, RNA polymerase II-specific',
+                          str_detect(category, 'GO:0032155') ~ 'obsolete cell division site part',
+                          str_detect(category, 'GO:0000989') ~ 'obsolete transcription factor activity, transcription factor binding',
+                          str_detect(category, 'GO:0000988') ~ 'obsolete transcription factor activity, protein binding',
+                          str_detect(category, 'GO:0044459') ~ 'obsolete plasma membrane part',
+                          str_detect(category, 'GO:0015198') ~ 'oligopeptide transmembrane transporter activity',
+                          str_detect(category, 'GO:0098589') ~ 'membrane',
+                          str_detect(category, 'GO:0044424') ~ 'obsolete intracellular part',
+                          str_detect(category, 'GO:0044712') ~ 'catabolic process',
+                          str_detect(category, 'GO:1903827') ~ 'regulation of protein localization',
+                          str_detect(category, 'GO:0044464') ~ 'obsolete cell part',
+                          str_detect(category, 'GO:1902593') ~ 'import into nucleus',
+                          str_detect(category, 'GO:0044437') ~ 'obsolete vacuolar part',
+                          str_detect(category, 'GO:0042787') ~ 'ubiquitin-dependent protein catabolic process',
+                          str_detect(category, 'GO:0015197') ~ 'peptide transmembrane transporter activity',
+                          str_detect(category, 'GO:0051186') ~ 'obsolete cofactor metabolic process',
+                          str_detect(category, 'GO:1903364') ~ 'positive regulation of protein catabolic process',
+                          str_detect(category, 'GO:0016458') ~ 'obsolete gene silencing',
+                          str_detect(category, 'GO:0017016') ~ 'small GTPase binding',
+                          str_detect(category, 'GO:0006464') ~ 'protein modification process',
+                          str_detect(category, 'GO:0006461') ~ 'protein-containing complex assembly',
+                          str_detect(category, 'GO:0048037') ~ 'obsolete cofactor binding',
+                          str_detect(category, 'GO:0051271') ~ 'obsolete negative regulation of cellular component movement',
+                          str_detect(category, 'GO:0032270') ~ 'positive regulation of protein metabolic process',
+                          str_detect(category, 'GO:0004872') ~ 'signaling receptor activity',
+                          str_detect(category, 'GO:0022891') ~ 'transmembrane transporter activity',
+                          str_detect(category, 'GO:0097223') ~ 'obsolete sperm part',
+                          str_detect(category, 'GO:0015077') ~ 'inorganic cation transmembrane transporter activity',
+                          str_detect(category, 'GO:0044447') ~ 'obsolete axoneme part',
+                          str_detect(category, 'GO:0015672') ~ 'inorganic cation transmembrane transport',
+                          str_detect(category, 'GO:0022892') ~ 'transmembrane transporter activity',
+                          str_detect(category, 'GO:0044765') ~ 'transport',
+                          str_detect(category, 'GO:1902578') ~ 'establishment of protein localization to mitochondrial membrane',
+                          str_detect(category, 'GO:0043623') ~ 'protein-containing complex assembly',
+                          str_detect(category, 'GO:0071822') ~ 'protein-containing complex organization',
+                          TRUE ~ term)) %>%
+  mutate(ontology = case_when(str_detect(category, 'GO:0044432') ~ 'CC',
+                              str_detect(category, 'GO:0018298') ~ 'BP',
+                              str_detect(category, 'GO:0044711') ~ 'BP',
+                              str_detect(category, 'GO:0044710') ~ 'BP',
+                              str_detect(category, 'GO:0001071') ~ 'MF',
+                              str_detect(category, 'GO:0044699') ~ 'BP',
+                              str_detect(category, 'GO:0044444') ~ 'CC',
+                              str_detect(category, 'GO:0044445') ~ 'CC',
+                              str_detect(category, 'GO:0044702') ~ 'BP',
+                              str_detect(category, 'GO:0044431') ~ 'CC',
+                              str_detect(category, 'GO:0044421') ~ 'CC',
+                              str_detect(category, 'GO:0000975') ~ 'MF',
+                              str_detect(category, 'GO:0044212') ~ 'MF',
+                              str_detect(category, 'GO:0006928') ~ 'BP',
+                              str_detect(category, 'GO:0016246') ~ 'BP',
+                              str_detect(category, 'GO:0044441') ~ 'CC',
+                              str_detect(category, 'GO:0006928') ~ 'BP',
+                              str_detect(category, 'GO:0055114') ~ 'BP',
+                              str_detect(category, 'GO:0044463') ~ 'CC',
+                              str_detect(category, 'GO:1902589') ~ 'BP',
+                              str_detect(category, 'GO:0044430') ~ 'CC',
+                              str_detect(category, 'GO:0044702') ~ 'BP',
+                              str_detect(category, 'GO:0005578') ~ 'CC',
+                              str_detect(category, 'GO:0044420') ~ 'CC',
+                              str_detect(category, 'GO:0044707') ~ 'BP',
+                              str_detect(category, 'GO:0070011') ~ 'MF',
+                              str_detect(category, 'GO:0022610') ~ 'BP',
+                              str_detect(category, 'GO:0044767') ~ 'BP',
+                              str_detect(category, 'GO:0044425') ~ 'CC',
+                              str_detect(category, 'GO:0051270') ~ 'BP',
+                              str_detect(category, 'GO:0001012') ~ 'MF',
+                              str_detect(category, 'GO:0051272') ~ 'BP',
+                              str_detect(category, 'GO:0000975') ~ 'MF',
+                              str_detect(category, 'GO:0044212') ~ 'MF',
+                              str_detect(category, 'GO:0001077') ~ 'MF',
+                              str_detect(category, 'GO:0000982') ~ 'MF',
+                              str_detect(category, 'GO:0032155') ~ 'CC',
+                              str_detect(category, 'GO:0000989') ~ 'MF',
+                              str_detect(category, 'GO:0000988') ~ 'MF',
+                              str_detect(category, 'GO:0044459') ~ 'CC',
+                              str_detect(category, 'GO:0015198') ~ 'MF',
+                              str_detect(category, 'GO:0098589') ~ 'CC',
+                              str_detect(category, 'GO:0044424') ~ 'CC',
+                              str_detect(category, 'GO:0044712') ~ 'BP',
+                              str_detect(category, 'GO:1903827') ~ 'BP',
+                              str_detect(category, 'GO:0044464') ~ 'CC',
+                              str_detect(category, 'GO:1902593') ~ 'BP',
+                              str_detect(category, 'GO:0044437') ~ 'CC',
+                              str_detect(category, 'GO:0042787') ~ 'BP',
+                              str_detect(category, 'GO:0015197') ~ 'MF',
+                              str_detect(category, 'GO:0051186') ~ 'BP',
+                              str_detect(category, 'GO:1903364') ~ 'BP',
+                              str_detect(category, 'GO:0016458') ~ 'BP',
+                              str_detect(category, 'GO:0017016') ~ 'MF',
+                              str_detect(category, 'GO:0006464') ~ 'BP',
+                              str_detect(category, 'GO:0006461') ~ 'BP',
+                              str_detect(category, 'GO:0048037') ~ 'MF',
+                              str_detect(category, 'GO:0051271') ~ 'BP',
+                              str_detect(category, 'GO:0032270') ~ 'BP',
+                              str_detect(category, 'GO:0004872') ~ 'MF',
+                              str_detect(category, 'GO:0022891') ~ 'MF',
+                              str_detect(category, 'GO:0097223') ~ 'CC',
+                              str_detect(category, 'GO:0015077') ~ 'MF',
+                              str_detect(category, 'GO:0044447') ~ 'CC',
+                              str_detect(category, 'GO:0015672') ~ 'BP',
+                              str_detect(category, 'GO:0022892') ~ 'MF',
+                              str_detect(category, 'GO:0044765') ~ 'BP',
+                              str_detect(category, 'GO:1902578') ~ 'BP',
+                              str_detect(category, 'GO:0043623') ~ 'BP',
+                              str_detect(category, 'GO:0071822') ~ 'BP',
+                              TRUE ~ ontology)) %>%
+  filter(!(term %>%str_detect("obsolete")))
+```
+
+### Pass ORA results to df and repeat with other direction
+```{r}
+#Remove GO terms pertaining to non-relevant processes (e.g,. from invertebrates)
+#host_GO_signif_down <- host_GO_signif_annot
+host_GO_signif_down2 <- host_GO_signif_down %>%
+  mutate(direction2 = 'down') %>%
+  filter(!(term %>%str_detect("brain|heart")))
+
+#host_GO_signif_up <- host_GO_signif_annot
+host_GO_signif_up2 <- host_GO_signif_up %>%
+  mutate(direction2 = 'up') %>%
+  filter(!(term %>%str_detect('angiogenesis|blood|costamere|node')))
+
+host_GO_analysis.export <- rbind(host_GO_signif_up2, host_GO_signif_down2) %>%
+  dplyr::select(contrast, direction2, direction, category, numDEInCat, numInCat, category, ontology, term, pval, padj_BH,
+                gene) %>%
+  rename('Coral colony' = contrast, 'Expression direction' = direction2, 'Enriched/depleted' = direction,
+         'GO ID' = category, 'GO aspect' = ontology, 'GO term' = term, 'p-value' = pval, 'p-value (adj)' = padj_BH,
+         'DEGs' = gene) %>%
+   write_csv(path = "./Table S4.csv", col_names = TRUE)
+```
+
+### Visualise results from ORA - upregulated DEGs
+```{r}
+#Plot
+host_enriched_BP.plot_up <- host_GO_signif_up2 %>%
+  filter(ontology == 'BP') %>%
+  filter(direction == 'enriched') %>%
+  group_by(contrast) %>%
+  top_n(15, wt = -pval) %>% 
+  mutate(gene_ratio = numDEInCat/numInCat) %>%
+  ggplot(aes(x = gene_ratio, y = fct_reorder(term, gene_ratio), colour = contrast, size = numDEInCat, alpha = pval)) +
+  geom_point(aes(shape = signif)) +
+  scale_x_continuous('Proportion of DEGs in GO term', limits = c(0, 1), expand = c(0,0)) +
+  scale_colour_manual('Coral colony', 
+                      values = c("#4F7942", "#40826D", "#93C572")) +
+  scale_shape_manual(values = c(16, 17)) +
+  scale_size_continuous('# DEGs in GO term', breaks = c(25,50,100,250,500), limits = c(0, 501)) +
+  scale_alpha_continuous('p-value', range = c(1, 1), breaks = c(0.0001, 0.01, 0.02, 0.03, 0.04), 
+                         labels = c('<0.001', '0.01', '0.02', '0.03', '0.04')) +
+  labs(y = "Biological Processes") +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.border = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "null"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = 'bold'),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = 'bold'), 
+        axis.text.y = element_text(size = 12, colour = "black")) +
+  guides(shape = F,
+         colour = guide_legend(override.aes = list(size = 3)),
+         alpha = guide_legend(override.aes = list(size = 3)))
+host_enriched_BP.plot_up
+
+host_enriched_MF.plot_up <- host_GO_signif_up2 %>%
+  filter(ontology == 'MF') %>%
+  filter(direction == 'enriched') %>%
+  group_by(contrast) %>%
+  top_n(15, wt = -pval) %>% 
+  mutate(gene_ratio = numDEInCat/numInCat) %>%
+  ggplot(aes(x = gene_ratio, y = fct_reorder(term, gene_ratio), colour = contrast, size = numDEInCat, alpha = pval)) +
+  geom_point(aes(shape = signif)) +
+  scale_x_continuous('Proportion of DEGs in GO term', limits = c(0, 1), expand = c(0,0)) +
+  scale_colour_manual('Coral colony', 
+                      values = c("#4F7942", "#40826D", "#93C572")) +
+  scale_size_continuous('# DEGs in GO term', breaks = c(25,50,100,250,500), limits = c(0, 501)) +
+  scale_shape_manual(values = c(16, 17)) +
+  scale_alpha_continuous('p-value', range = c(1, 0.25), breaks = c(0.001, 0.01, 0.02, 0.03, 0.04), 
+                         labels = c('<0.001', '0.01', '0.02', '0.03', '0.04')) +
+  labs(y = "Molecular Functions") +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.border = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "null"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = 'bold'),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = 'bold'), 
+        axis.text.y = element_text(size = 12, colour = "black")) +
+  guides(shape = F,
+         colour = guide_legend(override.aes = list(size = 3)),
+         alpha = guide_legend(override.aes = list(size = 3)))
+host_enriched_MF.plot_up
+
+host_enriched_CC.plot_up <- host_GO_signif_up2 %>%
+  filter(ontology == 'CC') %>%
+  filter(direction == 'enriched') %>%
+  group_by(contrast) %>%
+  top_n(15, wt = -pval) %>% 
+  mutate(gene_ratio = numDEInCat/numInCat) %>%
+  ggplot(aes(x = gene_ratio, y = fct_reorder(term, gene_ratio), colour = contrast, size = numDEInCat, alpha = pval)) +
+  geom_point(aes(shape = signif)) +
+  scale_x_continuous('Proportion of DEGs in GO term', limits = c(0, 1), expand = c(0,0)) +
+  scale_colour_manual('Coral colony', 
+                      values = c("#4F7942", "#40826D", "#93C572")) +
+  scale_size_continuous('# DEGs in GO term', breaks = c(25,50,100,250,500), limits = c(0, 801)) +
+  scale_shape_manual(values = c(16, 17)) +
+  scale_alpha_continuous('p-value', range = c(1, 0.25), breaks = c(0.001, 0.01, 0.02, 0.03, 0.04), 
+                         labels = c('<0.001', '0.01', '0.02', '0.03', '0.04')) +
+  labs(y = "Cellular Components") +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.border = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "null"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = 'bold'),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = 'bold'), 
+        axis.text.y = element_text(size = 12, colour = "black")) +
+  guides(shape = F,
+         colour = guide_legend(override.aes = list(size = 3)),
+         alpha = guide_legend(override.aes = list(size = 3)))
+host_enriched_CC.plot_up
+
+host_ORA.plots_up <- ggarrange(host_enriched_BP.plot_up + rremove('xlab') + rremove('x.text'),
+                            host_enriched_MF.plot_up + rremove('xlab') + rremove('x.text'),
+                            host_enriched_CC.plot_up,
+                            common.legend = T,
+                            legend = 'right',
+                            heights = c(1, 1, 0.75),
+                            widths = c(1, 1, 1),
+                            align = 'hv',
+                            ncol = 1)
+host_ORA.plots_up
+
+Fig.S2 <- host_ORA.plots_up
+```
+
+### Visualise results from ORA - downregulated DEGs
+```{r}
+#Plot
+host_enriched_BP.plot_down <- host_GO_signif_down2 %>%
+  filter(ontology == 'BP') %>%
+  filter(direction == 'enriched') %>%
+  group_by(contrast) %>%
+  top_n(15, wt = -pval) %>% 
+  mutate(gene_ratio = numDEInCat/numInCat) %>%
+  ggplot(aes(x = gene_ratio, y = fct_reorder(term, gene_ratio), colour = contrast, size = numDEInCat, alpha = pval)) +
+  geom_point(aes(shape = signif)) +
+  scale_x_continuous('Proportion of DEGs in GO term', limits = c(0, 1), expand = c(0,0)) +
+  scale_colour_manual('Coral colony', 
+                      values = c("#4F7942", "#40826D", "#93C572")) +
+  scale_shape_manual(values = c(16, 17)) +
+  scale_size_continuous('# DEGs in GO term', breaks = c(25,50,100,250,500), limits = c(0, 501)) +
+  scale_alpha_continuous('p-value', range = c(1, 1), breaks = c(0.0001, 0.01, 0.02, 0.03, 0.04), 
+                         labels = c('<0.001', '0.01', '0.02', '0.03', '0.04')) +
+  labs(y = "Biological Processes") +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.border = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "null"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = 'bold'),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = 'bold'), 
+        axis.text.y = element_text(size = 12, colour = "black")) +
+  guides(shape = F,
+         colour = guide_legend(override.aes = list(size = 3)),
+         alpha = guide_legend(override.aes = list(size = 3)))
+host_enriched_BP.plot_down
+
+host_enriched_MF.plot_down <- host_GO_signif_down2 %>%
+  filter(ontology == 'MF') %>%
+  filter(direction == 'enriched') %>%
+  group_by(contrast) %>%
+  top_n(15, wt = -pval) %>% 
+  mutate(gene_ratio = numDEInCat/numInCat) %>%
+  ggplot(aes(x = gene_ratio, y = fct_reorder(term, gene_ratio), colour = contrast, size = numDEInCat, alpha = pval)) +
+  geom_point(aes(shape = signif)) +
+  scale_x_continuous('Proportion of DEGs in GO term', limits = c(0, 1), expand = c(0,0)) +
+  scale_colour_manual('Coral colony', 
+                      values = c("#4F7942", "#40826D", "#93C572")) +
+  scale_size_continuous('# DEGs in GO term', breaks = c(25,50,100,250,500), limits = c(0, 501)) +
+  scale_shape_manual(values = c(16, 17)) +
+  scale_alpha_continuous('p-value', range = c(1, 0.25), breaks = c(0.001, 0.01, 0.02, 0.03, 0.04), 
+                         labels = c('<0.001', '0.01', '0.02', '0.03', '0.04')) +
+  labs(y = "Molecular Functions") +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.border = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "null"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = 'bold'),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = 'bold'), 
+        axis.text.y = element_text(size = 12, colour = "black")) +
+  guides(shape = F,
+         colour = guide_legend(override.aes = list(size = 3)),
+         alpha = guide_legend(override.aes = list(size = 3)))
+host_enriched_MF.plot_down
+
+host_enriched_CC.plot_down <- host_GO_signif_down2 %>%
+  filter(ontology == 'CC') %>%
+  filter(direction == 'enriched') %>%
+  group_by(contrast) %>%
+  top_n(15, wt = -pval) %>% 
+  mutate(gene_ratio = numDEInCat/numInCat) %>%
+  ggplot(aes(x = gene_ratio, y = fct_reorder(term, gene_ratio), colour = contrast, size = numDEInCat, alpha = pval)) +
+  geom_point(aes(shape = signif)) +
+  scale_x_continuous('Proportion of DEGs in GO term', limits = c(0, 1), expand = c(0,0)) +
+  scale_colour_manual('Coral colony', 
+                      values = c("#4F7942", "#40826D", "#93C572")) +
+  scale_size_continuous('# DEGs in GO term', breaks = c(25,50,100,250,500), limits = c(0, 1001)) +
+  scale_shape_manual(values = c(16, 17)) +
+  scale_alpha_continuous('p-value', range = c(1, 0.25), breaks = c(0.001, 0.01, 0.02, 0.03, 0.04), 
+                         labels = c('<0.001', '0.01', '0.02', '0.03', '0.04')) +
+  labs(y = "Cellular Components") +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.border = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "null"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = 'bold'),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = 'bold'), 
+        axis.text.y = element_text(size = 12, colour = "black")) +
+  guides(shape = F,
+         colour = guide_legend(override.aes = list(size = 3)),
+         alpha = guide_legend(override.aes = list(size = 3)))
+host_enriched_CC.plot_down
+
+host_ORA.plots_down <- ggarrange(host_enriched_BP.plot_down + rremove('xlab') + rremove('x.text'),
+                            host_enriched_MF.plot_down + rremove('xlab') + rremove('x.text'),
+                            host_enriched_CC.plot_down,
+                            common.legend = T,
+                            legend = 'right',
+                            heights = c(1, 1, 1),
+                            widths = c(1, 1, 1),
+                            align = 'hv',
+                            ncol = 1)
+host_ORA.plots_down
+
+Fig.S3 <- host_ORA.plots_down
+```
+
+### Export ORA plots 
+```{r}
+ggsave(plot = Fig.S2, "./Fig. S2.pdf",
+       path = "./",
+       width = 15,
+       height = 17.5,
+       units = 'in',
+       dpi = 300)
+
+ggsave(plot = Fig.S3, "./Fig. S3.pdf",
+       path = "./",
+       width = 15,
+       height = 17.5,
+       units = 'in',
+       dpi = 300)
+```
+
+
+### Identify significant DEGs associated with enriched GO terms (focus on significant GO terms with more than 5 DEGs)
+```{r}
+host_GO_signif_DEGs <- rbind(host_GO_signif_up2, host_GO_signif_down2) %>%
+  filter(direction == 'enriched') %>%
+  dplyr::select(category, term, ontology, contrast, gene) %>%
+  separate_rows(gene, sep = '; ')
+
+host_GO_signif_DEGs_count <- rbind(host_GO_signif_up2, host_GO_signif_down2) %>%
+  filter(direction == 'depleted') %>%
+  dplyr::select(category, term, ontology, contrast, gene, pval, padj_BH) %>%
+  group_by(contrast) %>%
+  filter(pval < 0.05) %>%
+  dplyr::select(category, contrast) %>%
+  distinct() %>%
+  dplyr::count()
+
+host.DEGs2 <- host.DEGs %>%
+  group_by(contrast) %>%
+  filter(padj < 0.05) %>%
+  dplyr::select(contrast, gene, log2FoldChange, padj)
+  
+host_GO_signif_DEGs2 <- left_join(host_GO_signif_DEGs, host.DEGs2,  by = c('contrast', 'gene')) %>%
+  drop_na() %>%
+  left_join(., dplyr::select(pdae_gene.annot, c(gene, hit_description)))
+```
+
+### Analysis of gene expression levels involved in GO terms of interest
+
+#### Categorise DEGs associated with GO terms
+```{r}
+host_GO_expression_raw <- host_GO_signif_DEGs2 %>%
+  unite("GO_gene", c('category', 'gene'), sep= "_", remove = F) %>%
+  group_by(contrast) %>%
+  mutate(group = case_when(
+    str_detect(term,"[A|a]scorbate|[C|c]atalase|[G|g]lutathione|[P|p]eroxidase|[P|p]eroxiredoxin|[S|s]uperoxide") ~ 'ROS scavengers',
+    str_detect(term,"[C|c]haperone|[D|d]naj|[H|h]eat shock|[H|h]sp70|[H|h]sp90") ~ 'Heat shock proteins',
+    str_detect(term,"[L|l]ipid") ~ 'Lipid metabolism',
+    str_detect(term, "[N|n]itr[a|i]te|[N|n]itrogen") ~ 'Organonitrogen processes',
+    str_detect(term,"[C|c]arbohydrate") ~ 'Carbohydrate metabolism',
+    str_detect(term,"[A|a]poptotic|[C|c]ell [D|d]eath") ~ 'Apopotosis processes',
+    str_detect(term, "[A|a]ntioxidant|[D|d]etoxification|[O|o]xidative|[U|u]nfolded|[R|r]epair|[R|r]efolding") ~ 'Oxidative stress markers',
+    TRUE ~ 'Other processes'))
+
+host_GO_expression_raw_count <- host_GO_expression_raw %>%
+  filter(group == 'Oxidative stress markers') %>%
+  dplyr::select(category, contrast, term) %>%
+  distinct() %>%
+  group_by(contrast) %>%
+  dplyr::count()
+```
+
+#### Volcano plot
+```{r}
+host_GO_expression_raw.df1 <- host_GO_expression_raw %>% 
+  filter(contrast == 'Colony_I') %>%
+  column_to_rownames(var = "GO_gene")
+
+host_GO_expression_raw.df2 <- host_GO_expression_raw %>% 
+  filter(contrast == 'Colony_J') %>%
+  column_to_rownames(var = "GO_gene")
+
+host_GO_expression_raw.df3 <- host_GO_expression_raw %>% 
+  filter(contrast == 'Colony_L') %>%
+  column_to_rownames(var = "GO_gene")
+
+#Define different groups that will be coloured and shaped differently
+group1.col <- c('Colony_I')
+group2.col <- c('Colony_J')
+group3.col <- c('Colony_L')
+
+group1.shape <- c('ROS scavenging')
+group2.shape <- c('Heat shock proteins')
+group3.shape <- c('Lipid processes')
+group4.shape <- c('Organonitrogen transport')
+group5.shape <- c('Other processes')
+
+#Create custom key-value pairs for different GO terms and host groups
+keyvals.col1 <- ifelse(
+  host_GO_expression_raw.df1$contrast %in% group1.col, '#4F7942',
+  'black')
+keyvals.col2 <- ifelse(
+  host_GO_expression_raw.df2$contrast %in% group2.col, '#40826D',
+  'black')
+keyvals.col3 <- ifelse(
+  host_GO_expression_raw.df3$contrast %in% group3.col, '#93C572',
+  'black')
+
+keyvals.shape1 <- ifelse(
+  host_GO_expression_raw.df1$group %in% group1.shape, 16,
+    ifelse(host_GO_expression_raw.df1$group %in% group2.shape, 15,
+           ifelse(host_GO_expression_raw.df1$group %in% group3.shape, 17,
+                  ifelse(host_GO_expression_raw.df1$group %in% group4.shape, 18,
+                         ifelse(host_GO_expression_raw.df1$group %in% group5.shape, 4,
+                                0)))))
+
+keyvals.shape2 <- ifelse(
+  host_GO_expression_raw.df2$group %in% group1.shape, 16,
+    ifelse(host_GO_expression_raw.df2$group %in% group2.shape, 15,
+           ifelse(host_GO_expression_raw.df2$group %in% group3.shape, 17,
+                  ifelse(host_GO_expression_raw.df2$group %in% group4.shape, 18,
+                         ifelse(host_GO_expression_raw.df2$group %in% group5.shape, 4,
+                                0)))))
+
+keyvals.shape3 <- ifelse(
+  host_GO_expression_raw.df3$group %in% group1.shape, 16,
+    ifelse(host_GO_expression_raw.df3$group %in% group2.shape, 15,
+           ifelse(host_GO_expression_raw.df3$group %in% group3.shape, 17,
+                  ifelse(host_GO_expression_raw.df3$group %in% group4.shape, 18,
+                         ifelse(host_GO_expression_raw.df3$group %in% group5.shape, 4,
+                                0)))))
+
+keyvals.col1[is.na(keyvals.col1)] <- 'black'
+names(keyvals.col1)[keyvals.col1 == '#4F7942'] <- 'Colony I'
+
+keyvals.col2[is.na(keyvals.col2)] <- 'black'
+names(keyvals.col2)[keyvals.col2 == '#40826D'] <- 'Colony J'
+
+keyvals.col3[is.na(keyvals.col3)] <- 'black'
+names(keyvals.col3)[keyvals.col3 == '#93C572'] <- 'Colony L'
+
+keyvals.shape1[is.na(keyvals.shape1)] <- 0
+names(keyvals.shape1)[keyvals.shape1 == 16] <- 'ROS scavenging'
+names(keyvals.shape1)[keyvals.shape1 == 15] <- 'Heat shock proteins'
+names(keyvals.shape1)[keyvals.shape1 == 17] <- 'Lipid processes'
+names(keyvals.shape1)[keyvals.shape1 == 18] <- 'Organonitrogen transport'
+names(keyvals.shape1)[keyvals.shape1 == 4] <- 'Other processes'
+
+keyvals.shape2[is.na(keyvals.shape2)] <- 0
+names(keyvals.shape2)[keyvals.shape2 == 16] <- 'ROS scavenging'
+names(keyvals.shape2)[keyvals.shape2 == 15] <- 'Heat shock proteins'
+names(keyvals.shape2)[keyvals.shape2 == 17] <- 'Lipid processes'
+names(keyvals.shape2)[keyvals.shape2 == 18] <- 'Organonitrogen transport'
+names(keyvals.shape2)[keyvals.shape2 == 4] <- 'Other processes'
+
+keyvals.shape3[is.na(keyvals.shape3)] <- 0
+names(keyvals.shape3)[keyvals.shape3 == 16] <- 'ROS scavenging'
+names(keyvals.shape3)[keyvals.shape3 == 15] <- 'Heat shock proteins'
+names(keyvals.shape3)[keyvals.shape3 == 17] <- 'Lipid processes'
+names(keyvals.shape3)[keyvals.shape3 == 18] <- 'Organonitrogen transport'
+names(keyvals.shape3)[keyvals.shape3 == 4] <- 'Other processes'
+
+host_GO_expression_raw.volc_plot1 <- EnhancedVolcano(host_GO_expression_raw.df1, lab = NA,
+                                                   x = 'log2FoldChange', y = 'padj_BH',
+                                                   xlim = c(-6, 6), #ylim = c(0, -log10(10e-52)),
+                                                   title = '', subtitle = '', caption = '',
+                                                   legendPosition = "top", legendLabSize = 8, legendIconSize = 2,
+                                                   pCutoff = 0.05, FCcutoff = 0.58,
+                                                   cutoffLineWidth = 0.25, cutoffLineCol = "black", 
+                                                   cutoffLineType = "dashed",
+                                                   colCustom = keyvals.col1,
+                                                   shapeCustom = keyvals.shape1,
+                                                   pointSize = c(ifelse(host_GO_expression_raw.df1$group == 
+                                                                          'Other processes', 0.5, 2)),
+                                                   gridlines.minor = F, gridlines.major = F,
+                                                   labSize = 3.0, axisLabSize = 14, colAlpha = 1) + 
+  theme(plot.margin=unit(c(-2,-0.25,-0.95,0), "cm")) +
+  guides(colour = F)
+
+host_GO_expression_raw.volc_plot2 <- EnhancedVolcano(host_GO_expression_raw.df2, lab = NA,
+                                                   x = 'log2FoldChange', y = 'padj_BH',
+                                                   xlim = c(-6, 6), #ylim = c(0, -log10(10e-52)),
+                                                   title = '', subtitle = '', caption = '',
+                                                   legendPosition = "top", legendLabSize = 8, legendIconSize = 2,
+                                                   pCutoff = 0.05, FCcutoff = 0.58,
+                                                   cutoffLineWidth = 0.25, cutoffLineCol = "black", 
+                                                   cutoffLineType = "dashed",
+                                                   colCustom = keyvals.col2,
+                                                   shapeCustom = keyvals.shape2,
+                                                   pointSize = c(ifelse(host_GO_expression_raw.df2$group == 
+                                                                          'Other processes', 0.5, 2)),
+                                                   gridlines.minor = F, gridlines.major = F,
+                                                   labSize = 3.0, axisLabSize = 14, colAlpha = 1) + 
+  theme(plot.margin=unit(c(-2,-0.25,-0.95,0), "cm")) +
+  guides(colour = F)
+
+host_GO_expression_raw.volc_plot3 <- EnhancedVolcano(host_GO_expression_raw.df3, lab = NA,
+                                                   x = 'log2FoldChange', y = 'padj_BH',
+                                                   xlim = c(-6, 6), #ylim = c(0, -log10(10e-52)),
+                                                   title = '', subtitle = '', caption = '',
+                                                   legendPosition = "top", legendLabSize = 8, legendIconSize = 2,
+                                                   pCutoff = 0.05, FCcutoff = 0.58,
+                                                   cutoffLineWidth = 0.25, cutoffLineCol = "black", 
+                                                   cutoffLineType = "dashed",
+                                                   colCustom = keyvals.col3,
+                                                   shapeCustom = keyvals.shape3,
+                                                   pointSize = c(ifelse(host_GO_expression_raw.df3$group ==
+                                                                          'Other processes', 0.5, 2)),
+                                                   gridlines.minor = F, gridlines.major = F,
+                                                   labSize = 3.0, axisLabSize = 14, colAlpha = 1) + 
+  theme(plot.margin=unit(c(-2,-0.25,-0.95,0), "cm")) +
+  guides(colour = F)
+
+host_GO_expression_raw.volc_plots <- ggarrange(host_GO_expression_raw.volc_plot1 + rremove('ylab') + rremove('xlab'),
+                                              host_GO_expression_raw.volc_plot2 + rremove('ylab') + rremove('xlab'),
+                                              host_GO_expression_raw.volc_plot3 + rremove('ylab') + rremove('xlab'),
+                                              common.legend = T,
+                                              legend = "top",
+                                              heights = c(1, 1, 1),
+                                              align = 'hv',
+                                              ncol = 3)
+host_GO_expression_raw.volc_plots
+
+host_GO_expression_raw.volc_plots_annot <- annotate_figure(host_GO_expression_raw.volc_plots,
+                                                          bottom = text_grob(bquote(bold(~Log[2]~"Fold Change")),
+                                                                             color = "black", face = "bold", size = 14),
+                                                          left = text_grob(bquote(bold(~-Log[10] ~ italic(P))),
+                                                                           color= "black",face = "bold",size = 14,rot = 90))
+host_GO_expression_raw.volc_plots_annot
+#Fig.5B <- host_GO_expression_raw.volc_plots_annot
+```
+
+
+#### Density plot of lg2fc
+```{r}
+host_GO_expression_raw.ridge_plot <- host_GO_expression_raw %>%
+  filter(ontology != 'CC') %>%
+  filter(group != 'Other processes') %>%
+  filter(group != 'Organonitrogen processes') %>%
+  ggplot(aes(x = log2FoldChange, y = reorder(term, log2FoldChange), fill = contrast, colour = contrast)) +
+  geom_vline(aes(xintercept = 0), linetype = 'dashed', size = 0.25) +
+  geom_density_ridges(jittered_points = TRUE, position = position_points_jitter(height = 0),
+                      point_shape = "|", point_size = 2, point_alpha = 1, #point_colour = 'black', 
+                      alpha = 0.5, scale = 1, size = 0) +
+  scale_fill_manual('Coral genotype', 
+                    values = c('#4F7942', '#40826D','#93C572'),
+                    labels = c('I', 'J', 'L')) +
+  scale_colour_manual('Coral genotype', 
+                    values = c('#4F7942', '#40826D','#93C572'),
+                    labels = c('I', 'J', 'L')) +
+  scale_x_continuous(expand = c(0, 0), limits = c(-4, 4), breaks = -4:4*2) +
+  facet_grid(group~., scales = "free_y", space="free_y") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.border = element_blank(),
+        strip.background = element_rect(color="white", fill="white", linewidth=0, linetype="solid"),
+        strip.text.y = element_text(size = 12, face = "bold", angle = 0),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = 'top',
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = 'bold'),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = 'bold'), 
+        axis.text.y = element_text(size = 12, colour = "black")) +
+  labs(x = bquote(bold(~Log[2]~"Fold Change")), y = 'Gene ontology') +
+  guides(colour = F)
+host_GO_expression_raw.ridge_plot
+
+Fig.6A <- host_GO_expression_raw.ridge_plot
+```
+
+### Combine sym and host ORA plots and export
+```{r}
+GO_expression_raw.plots <- ggarrange(Fig.6A,
+                                     Fig.6B,
+                                     labels = c("A", "B"),
+                                     align = 'hv',
+                                     heights = c(1, 0.9),
+                                     widths = c(1, 1),
+                                     ncol = 1)
+GO_expression_raw.plots
+
+ggsave(plot = GO_expression_raw.plots, "./Fig. 6.pdf",
+       path = "./",
+       width = 15,
+       height = 12.5,
+       units = 'in',
+       dpi = 300)
+```
+
+## GSEA analysis
+```{r}
+host.DEGs.gsea_I <- host.DEGs %>%
+  filter(contrast == 'Colony_I') %>%
+  drop_na() %>%
+  distinct() %>%
+  dplyr::select(gene, log2FoldChange) %>%
+  arrange(-log2FoldChange) %>%
+  pull(log2FoldChange, gene)
+
+host.DEGs.gsea_J <- host.DEGs %>%
+  filter(contrast == 'Colony_J') %>%
+  drop_na() %>%
+  distinct() %>%
+  dplyr::select(gene, log2FoldChange) %>%
+  arrange(-log2FoldChange) %>%
+  pull(log2FoldChange, gene)
+
+host.DEGs.gsea_L <- host.DEGs %>%
+  filter(contrast == 'Colony_L') %>%
+  drop_na() %>%
+  distinct() %>%
+  dplyr::select(gene, log2FoldChange) %>%
+  arrange(-log2FoldChange) %>%
+  pull(log2FoldChange, gene)
+
+#Introduce some variation to avoid DEGs with same expression levels
+tied_values_I <- which(duplicated(host.DEGs.gsea_I) | duplicated(host.DEGs.gsea_I, fromLast = TRUE))
+tied_values_J <- which(duplicated(host.DEGs.gsea_J) | duplicated(host.DEGs.gsea_J, fromLast = TRUE))
+tied_values_L <- which(duplicated(host.DEGs.gsea_L) | duplicated(host.DEGs.gsea_L, fromLast = TRUE))
+
+host.DEGs.gsea_I[tied_values_I] <- host.DEGs.gsea_I[tied_values_I] + runif(length(tied_values_I), min = 0, max = 0.001)
+host.DEGs.gsea_J[tied_values_J] <- host.DEGs.gsea_J[tied_values_J] + runif(length(tied_values_J), min = 0, max = 0.001)
+host.DEGs.gsea_L[tied_values_L] <- host.DEGs.gsea_L[tied_values_L] + runif(length(tied_values_L), min = 0, max = 0.001)
+
+#Preapre GO list
+host_GO.list2 <- split(host_GO.df$gene, host_GO.df$GO_ID)
+
+#Run GSEA analysis
+fgseaRes_I <- fgsea(pathways = host_GO.list2, stats = host.DEGs.gsea_I,
+                  eps = 0.0, minSize  = 5, maxSize  = 500) %>%
+  as_tibble() %>% 
+  arrange(padj)
+
+fgseaRes_J <- fgsea(pathways = host_GO.list2, stats = host.DEGs.gsea_J,
+                  eps = 0.0, minSize  = 5, maxSize  = 500) %>%
+  as_tibble() %>% 
+  arrange(padj)
+
+fgseaRes_L <- fgsea(pathways = host_GO.list2, stats = host.DEGs.gsea_L,
+                  eps = 0.0, minSize  = 5, maxSize  = 500) %>%
+  as_tibble() %>% 
+  arrange(padj)
+```

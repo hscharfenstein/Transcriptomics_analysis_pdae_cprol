@@ -1,0 +1,103 @@
+---
+title: "Heat stress timeline"
+author: "Hugo Scharfenstein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Load packages
+```{r}
+#Data import and export packages
+library(readxl)
+library(writexl)
+#Data wrangling packages
+library(tidyverse)
+#Packages for plots
+library(magick)
+library(ggforce)
+library(ggpubr)
+```
+
+# Load data
+```{r}
+HSE.df <- read_xlsx("./RNAseq dataset.xlsx", sheet = 1)
+```
+
+# Calculate experimental Degree Heating Weeks (eDHWs)
+```{r}
+HSE.df2 <- HSE.df %>%
+  mutate(MMM = 29.22279) %>% #Maximum monthly mean for Falcon Reef
+  mutate(Bleaching_threshold = MMM + 1) %>%
+  mutate(HotSpot = Temp_programmed - Bleaching_threshold) %>%
+  mutate(eDHW = HotSpot*(Time_above_bleaching_threshold/7)) %>%
+  mutate(eDHW= round(eDHW, digits = 1))
+
+#eDHWs were calculated according to: https://coralreefwatch.noaa.gov/product/5km/tutorial/crw10a_dhw_product.php
+```
+
+# Plot the experimental timeline
+```{r}
+HSE.plot <- HSE.df2 %>%
+ggplot(aes(x = Time_day)) +
+  geom_line(aes(y = Temp_measured, colour = Temp_treatment), alpha = 1, size = 1) +
+  geom_line(aes(y = Temp_programmed, colour = Temp_treatment), alpha = 0.5, size = 1) +
+  geom_point(aes(x = 30.5, y = 32.25), fill = '#CB181D', size = 4, pch = 21) +
+  geom_point(aes(x = 33.5, y = 27), fill = '#2171B5', size = 4, pch = 21) +
+  scale_colour_manual('Temperature treatment', values = c('#2171B5', '#CB181D')) +
+  scale_fill_manual(values = c('#2171B5', '#CB181D')) +
+  scale_x_continuous('Time (days)', expand = c(0,0), limits = c(0, 34), breaks = c(0:33*3)) +
+  scale_y_continuous('Temperature (°C)') +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.border = element_blank(),
+        panel.spacing = unit(0.5, "lines"),
+        legend.title = element_text(size = 14, colour = "black", face = "bold"),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.position = c(0.2, 0.85),
+        plot.tag = element_text(size = 14, face = "bold"),
+        strip.text.y = element_text(size = 14, face = "bold"),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = "bold"),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = "bold"), 
+        axis.text.y = element_text(size = 12, colour = "black"))
+HSE.plot
+
+Fig.1B <- HSE.plot
+
+#Run 'Bleaching levels.Rmd' to obtain Fig. 1C
+Fig.1BCD <- ggarrange(Fig.1B,
+                      Fig.1CD ,
+                      nrow = 2,
+                      labels = c("B", ""),
+                      heights = c(0.5, 1),
+                      widths = c(1, 1))
+Fig.1BCD
+```
+
+# Save the plot
+```{r}
+ggsave(plot = Fig.1BCD, "Fig. 1BCD.pdf",
+       path = "./",
+       width = 12.5,
+       height = 10,
+       units = 'in',
+       dpi = 300,
+       device = cairo_pdf)
+```
+
+# Merge panels into Figure 1
+```{r}
+Fig.1A2 <- image_read_pdf("./Fig. 1A.pdf")
+Fig.1BCD2 <- image_read_pdf("./Fig. 1BCD.pdf")
+
+Fig.1 <- c(Fig.1A2, Fig.1BCD2) %>% 
+    image_append(stack = TRUE)
+
+cairo_pdf('./Fig. 1.pdf')
+plot(Fig.1)
+dev.off()
+```
+

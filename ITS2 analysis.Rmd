@@ -1,0 +1,282 @@
+---
+title: "ITS2 analysis"
+author: "Hugo Scharfenstein"
+date: "02/09/2022"
+output: html_document
+---
+Load packages
+```{r}
+#General packages
+library(tidyverse)
+library(readxl)
+library(devtools)
+library(forcats)
+library(janitor)
+library(ggtree)
+```
+
+# Import and organise data
+```{r}
+ITS2.df <- read_xlsx("./RNAseq dataset.xlsx", sheet = 3) %>%
+  mutate(Seq = as.factor(Seq)) #Convert sequence and profile names to factor
+```
+
+# Check sequences against reference profiles of C. proliferum and native symbionts
+```{r}
+#Check sequences of samples against reference ITS2 profiles (for C. proliferum and control corals with native symbionts)
+Checklist.df <- read_xlsx("./RNAseq dataset.xlsx", sheet = 4)  %>%
+  filter(!str_detect(Seq, "p_|profile|_")) %>%
+  dplyr::select(c("Seq", "Symbiont_origin")) %>%
+  dplyr::count(Seq, Symbiont_origin)
+
+ITS2.df2 <- merge(Checklist.df[,c("Seq", "Symbiont_origin")], ITS2.df, by = "Seq", all = TRUE) %>%
+  mutate(Symbiont = case_when(is.na(Symbiont_origin) ~ Seq,
+                               TRUE ~ Symbiont_origin)) %>%
+  dplyr::relocate(c("Seq", "Symbiont"), .after = Count) %>%
+  dplyr::select(-(Symbiont_origin))
+```
+
+# Calculate relative abundance of DIVs/ITS2 profiles
+```{r}
+#Split data into DIV only df & calculate relative abundance of DIVs in each sample
+DIV.df <- ITS2.df2 %>%
+  filter(!str_detect(Seq, "p_|profile")) %>%
+  group_by(Col_plug, Sequencing_run) %>%
+  mutate(Rel_abundance = Count/sum(Count)) %>%
+  mutate(Symbiont = case_when(str_detect(Symbiont, "_[:alpha:]") ~ "Non-DIV sequences",
+                              TRUE ~ Symbiont)) %>%
+  relocate("Rel_abundance", .after = Count) %>%
+  ungroup()
+
+##Split data into ITS2 profile only df & calculate relative abundance of ITS2 profiles in each sample
+Profile.df <- ITS2.df2 %>%
+  filter(str_detect(Seq, "p_|profile")) %>%
+  group_by(Col_plug, Sequencing_run) %>%
+  mutate(Rel_abundance = Count/sum(Count)) %>%
+  relocate("Rel_abundance", .after = Count) %>%
+  ungroup()
+```
+
+# Classify samples according to dominant symbiont
+```{r}
+DIV.df2 <-  DIV.df %>%
+  mutate(DIV_category = case_when(str_detect(Seq, "A[:digit:]") ~ "Symbiodinium DIVs",
+                                  str_detect(Seq, "C[:digit:]") ~ "Cladocopium DIVs",
+                                  str_detect(Seq, "D[:digit:]") ~ "Durusdinium DIVs",
+                                  str_detect(Seq, "_[:alpha:]") ~ "Non-DIV sequences")) %>%
+  mutate(Symbiont2 = case_when(str_detect(Seq, "A[:digit:]") ~ "Native symbiont (A)",
+                              str_detect(Seq, "\\bC3\\b") ~ "C. proliferum/Native symbiont (C3)",
+                              str_detect(Seq,"\\C1\\b|C1b|C42.2|C1bh|C1c|C1br|C1cb|C1w|C3ju|C72k|C42ao|C42ca|C3sa|C1al|C3ew|C1jx|C1cu|C42au|C1t|C1cv|C1kt") ~ 
+                                "C. proliferum (C1)",
+                              str_detect(Seq,"C21|C21e|C21af|C3at|C3db|C21d|C3b|C21cg|C3av|C21az|C3dp|C3eg|C3te|C3rh|C3ey") ~ "Native symbiont (C21)",
+                              str_detect(Seq, "C40|C40[:alpha:]|C115|C115[:alpha:]") ~ "Native symbiont (C40)",
+                              str_detect(Seq, "C50|C50[:alpha:]|C21ba|C3gj|C3.10") ~ "Native symbiont (C50)",
+                              str_detect(Seq,"D1|D2|D4|D4c|D1h|D1fy|D6|D17|D1ih|D1as|D1ii") ~ "Native symbiont (D1)",
+                              str_detect(Seq, "D5m") ~ "Other Durusdinium DIVs",
+                              str_detect(Seq, "_[:alpha:]") ~ "Non-DIV sequences",
+                              str_detect(Seq, "No sequence") ~ "No sequence",
+                              TRUE ~ "Other Cladocopium DIVs")) %>%
+  filter(Symbiont != "No sequence")
+
+#Bin samples into three categories:
+# Inoculum over >= 50% of DIV counts (C. proliferum dominant)
+# Inoculum >= 1% & < 50% of DIV counts (C. proliferum present)
+# Inoculum absent (C. proliferum absent)
+
+DIV.df3 <- DIV.df2 %>%
+  group_by(Col_plug, Symbiont2) %>%
+  mutate(Count_sym = sum(Count)) %>%
+  dplyr::select(Col_plug, RNAseq_sequenced, Symbiont2, Count_sym) %>%
+  distinct() %>%
+  filter(RNAseq_sequenced == "Yes") %>%
+  ungroup(Symbiont2) %>%
+  mutate(Count_total = sum(Count_sym)) %>%
+  mutate(Count_percent = (Count_sym/Count_total)*100) %>%
+  filter(Symbiont2 == "C. proliferum (C1)") %>%
+  distinct() %>%
+  mutate(Cprol_abundance = case_when(Count_percent >= 50 ~ 'Dominant',
+                                     Count_percent >= 1 & Count_percent < 50 ~ 'Present'))
+```
+
+# DIV plot
+```{r}
+#Create a custom colour pallette
+A_pal <- c("#FBD85D")
+names(A_pal) <- c("")
+C1_pal <- c("#DB8941")
+names(C1_pal) <- c("C. proliferum (C1)")
+C3_pal <- c("#FBD85D")
+names(C3_pal) <- c("C. proliferum/Native symbiont (C3)")
+C21_pal <- c("#0e3b5c")
+names(C21_pal) <- c("Native symbiont (C21)")
+C40_pal <- c("#5e4f6d")
+names(C40_pal) <- c("Native symbiont (C40)")
+C50_pal <- c("#9f6671")
+names(C50_pal) <- c("Native symbiont (C50)")
+D1_pal <- c("#17594A")
+names(D1_pal) <- c("Native symbiont (D1)")
+otherClad_pal <- c("#DDE6ED")
+names(otherClad_pal) <- c("Other Cladocopium DIVs")
+otherDurus_pal <- c("#9EB384")
+names(otherDurus_pal) <- c("Other Durusdinium DIVs")
+nonDIV_pal <- c("#B4B4B3")
+names(nonDIV_pal) <- c("Non-DIV sequences")
+
+DIV_plot.pal <- c(A_pal, C1_pal, C3_pal, C21_pal, C40_pal, C50_pal, D1_pal, otherClad_pal, otherDurus_pal, nonDIV_pal)
+
+#Relevel treatment order & symbiont order
+DIV.df2$Treat_temp <- factor(DIV.df2$Treat_temp, 
+                             levels = c("SS8 - Ambient", "SS1 - Ambient", "WT10 - Ambient", "RIC - Ambient",
+                                        "C - Ambient", "SS8 - Elevated", "SS1 - Elevated", "WT10 - Elevated",
+                                        "RIC - Elevated", "C - Elevated"))
+
+DIV.df2$Symbiont2 <- factor(DIV.df2$Symbiont2,
+                           levels = c("Native symbiont (A)", "C. proliferum (C1)", "C. proliferum/Native symbiont (C3)",
+                                      "Native symbiont (C21)", "Native symbiont (C40)", "Native symbiont (C50)",
+                                      "Native symbiont (D1)", "Other Cladocopium DIVs", "Other Durusdinium DIVs",
+                                      "Non-DIV sequences"))
+DIV.plot <- DIV.df2 %>%
+  filter(RNAseq_sequenced == "Yes") %>%
+  ggplot(aes(y = Col_plug, x = Rel_abundance, fill = Symbiont2)) +
+  geom_bar(stat = "identity", position = "fill") +
+  facet_wrap(Temp_treatment * RI_treatment~., scales = "free_y", nrow = 2) +
+  scale_fill_manual(guide = "none", values = DIV_plot.pal) +
+  scale_y_discrete(labels = function(.y) ifelse(.y %in% c('L_1322', 'L_1290', 'J_1028', 'L_1334'), paste0("*", .y), .y)) +
+  theme_bw() +
+  theme(panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "null"),
+        #aspect.ratio = 1,
+        strip.text.x = element_text(size  = 14, face = "bold"),
+        legend.title=element_text(size = 14, face = "bold"),
+        legend.text=element_text(size = 12),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.x = element_text(size = 12, colour = "black", angle = 45, hjust = 1, vjust = 1),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 12, colour = "black"),
+        legend.position = "right",
+        legend.key.size = unit(0.3, "cm")) +
+  labs(y = "Colony & Sample ID", x = "Relative Abundance (%)") +
+  guides(fill = guide_legend(ncol = 1, title = "Photosymbiont lineage (DIV)"))
+DIV.plot
+
+Fig.2A <- DIV.plot
+```
+
+# ITS2 profile plot
+```{r}
+Profile.plot <- Profile.df %>%
+  filter(RNAseq_sequenced == "Yes") %>%
+  ggplot(aes(y = Col_plug, x = Rel_abundance, fill = Symbiont)) +
+  geom_bar(stat = "identity", position = "fill") +
+  facet_wrap(Temp_treatment * RI_treatment~., scales = "free_y", nrow = 2) +
+  scale_y_discrete(labels = function(.y) ifelse(.y %in% c('L_1322', 'L_1290', 'J_1028', 'L_1334'), paste0("*", .y), .y)) +
+  scale_fill_manual(guide = "none", values = c("#B4B4B3", "#DB8941", "#E19346", "#E79D4B", "#EEA750", "#F4B155", "#FABB5A",
+                                               "#0E3B5C", "#0F4267", "#114972", "#124F7D", "#145689", "#155D94", "#16649F",
+                                               "#1971B5", "#d8897b", "#5e4f6d", "#9f6671", "#144272", "#17594A", "#1B6756",
+                                               "#1E7562", "#22836E", "#259179", "#299F85", "#2CAD91")) +
+  theme_bw() +
+  theme(panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "null"),
+        #aspect.ratio = 1,
+        strip.text.x = element_text(size  = 14, face = "bold"),
+        legend.title=element_text(size = 14, face = "bold"),
+        legend.text=element_text(size = 12),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.text.x = element_text(size = 12, colour = "black", angle = 45, hjust = 1, vjust = 1),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 12, colour = "black"),
+        legend.position = "right",
+        legend.key.size = unit(0.3, "cm")) +
+        labs(y = "Colony & Sample ID", x = "Relative Abundance (%)") +
+  guides(fill = guide_legend(ncol = 1, title = "ITS2 profiles"))
+Profile.plot
+
+Fig.S1 <- Profile.plot
+
+ITS2.plots <- ggarrange(DIV.plot,
+                        Profile.plot,
+                        labels = c("A", "B"),
+                        nrow = 2,
+                        align = 'hv')
+ITS2.plots
+```
+
+# C. proliferum abundance plot
+```{r}
+DIV.df4 <- left_join(DIV.df3, dplyr::select(DIV.df2, c(Col_plug, Temp_treatment, RI_treatment))) %>%
+  distinct() %>%
+  mutate(Count_percent = Count_percent/100)
+
+Cprol_abund.plot <- DIV.df4 %>%
+  filter(!(RI_treatment %in% c('C', 'RIC'))) %>%
+  filter(!(Col_plug %in% c('L_1322', 'L_1334'))) %>%
+  ggplot() +
+  geom_vline(aes(xintercept = 0.5), linetype = 'dashed', colour = 'black', size = 0.25) +
+  geom_density_ridges(aes(x = Count_percent, y = RI_treatment, fill = Temp_treatment), 
+                      alpha = 0.5, size = 0.1, position = 'dodge',
+                      stat = "binline", bins = 150, scale = 0.9) +
+  scale_fill_manual('Temperature treatment', values = c('#2171B5', '#CB181D')) +
+  scale_x_continuous('Proportion of C. proliferum') +
+  scale_y_discrete('Inoculation treatment', expand = c(0,0)) +
+  expand_limits(y = c(1,3.9)) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.border = element_blank(),
+        plot.margin = unit(c(0,0,0,0), "null"),
+        legend.title = element_text(size = 14, colour = "black", face = "bold"),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.position = 'right',
+        plot.tag = element_text(size = 14, face = "bold"),
+        strip.text.y = element_text(size = 14, face = "bold"),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = "bold"),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = "bold"), 
+        axis.text.y = element_text(size = 12, colour = "black")) + 
+  annotate("segment", x = 0.5, y = 3.65, xend = 0.01, yend = 3.65, 
+           arrow = arrow(type = "open", length = unit(0.02, "npc"))) +
+  annotate("text", x = 0.25, y = 3.75, label = "C. proliferum present", color = "black", 
+         angle = 0, size = 4) +
+  annotate("segment", x = 0.5, y = 3.65, xend = 1, yend = 3.65, 
+           arrow = arrow(type = "open", length = unit(0.02, "npc"))) +
+  annotate("text", x = 0.75, y = 3.75, label = "C. proliferum dominant", color = "black", 
+         angle = 0, size = 4) +
+  annotate("segment", x = -0.02, y = 3.65, xend = 0, yend = 1, 
+           arrow = arrow(type = "open", length = unit(0.02, "npc"))) +
+  annotate("text", x = 0, y = 3.75, label = "C. proliferum absent", color = "black", 
+         angle = 0, size = 4)
+Cprol_abund.plot
+
+Fig.2B <- Cprol_abund.plot
+
+Fig.2 <- ggarrange(Fig.2A,
+                   Fig.2B,
+                   labels = c("A", "B"),
+                   heights = c(1, 0.75),
+                   nrow = 2,
+                   align = 'hv')
+Fig.2
+```
+
+# Save the graphs
+```{r}
+ggsave(plot = Fig.2, "Fig. 2.pdf",
+       path = "./",
+       width = 15,
+       height = 10,
+       units = 'in',
+       dpi = 300)
+
+ggsave(plot = Fig.S1, "Fig. S1.pdf",
+       path = "./",
+       width = 20,
+       height = 10,
+       units = 'in',
+       dpi = 300)
+```

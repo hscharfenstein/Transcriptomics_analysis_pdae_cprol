@@ -1,0 +1,239 @@
+---
+title: "Bleaching levels"
+author: "Hugo Scharfenstein"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Load packages
+```{r}
+#Data import and export packages
+library(readxl)
+library(writexl)
+#Data wrangling packages
+library(tidyverse)
+library(scales)
+library(rstatix)
+#Packages for plots
+library(ggforce)
+library(ggridges)
+library(ggpubr)
+```
+
+# Load data
+```{r}
+Bleach.df <- read_xlsx("./RNAseq dataset.xlsx", sheet = 2)
+```
+
+# Calculate mean gray values for each sample
+```{r}
+Bleach.df2 <- Bleach.df %>%
+  #rescale(c(0, 250), to = c(0, 100))
+  group_by(Col_plug) %>%
+  mutate(Mean_gray_value = mean(Gray_value)) %>%
+  dplyr::select(-(Gray_value), -(SD_gray_value), -(AOI)) %>%
+  distinct() %>%
+  ungroup()
+```
+
+# Merge bleaching levels with ITS2 data
+```{r}
+#Run 'ITS2 analysis.Rmd' first to obtain DIV.df3
+Bleach.df3 <- left_join(Bleach.df2, DIV.df3, by = c("Col_plug", "RNAseq_sequenced")) %>%
+  filter(RNAseq_sequenced == 'Yes') %>%
+  mutate(Cprol_abundance = case_when(str_detect(Cprol_abundance, 'Dominant') ~ 'Dominant',
+                                     str_detect(Cprol_abundance, 'Present') ~ 'Present',
+                                     TRUE ~ 'Absent')) %>%
+  mutate(Cprol_strains = case_when(str_detect(RI_treatment, 'C|RIC') ~ 'C21',
+                                   str_detect(RI_treatment, 'WT10') ~ 'WT10',
+                                   str_detect(RI_treatment, 'SS') ~ 'SS')) %>%
+  dplyr::select(-(c(RNAseq_sampled, Symbiont2, Count_sym, Count_total))) %>%
+  mutate_if(is.numeric, ~replace(., is.na(.), 0)) %>%
+  mutate(Count_percent = Count_percent/100) %>%
+  unite("Cprol_abund_strain", c(Cprol_abundance, Cprol_strains), remove = F)
+```
+
+# Calculate pigmentation (mean gray values) for each coral colony and photosymbiont community
+```{r}
+Bleach.df4 <- Bleach.df3 %>%
+  group_by(Cprol_abundance, Cprol_strains, Temp_treatment) %>%
+  mutate(Treat_gray_value_cprol = mean(Mean_gray_value)) %>%
+  ungroup() %>%
+  group_by(Cprol_abundance, Cprol_strains) %>%
+  mutate(Delta_gray_value_cprol = Mean_gray_value - Treat_gray_value_cprol[Temp_treatment == 'Ambient']) %>%
+  ungroup() %>%
+  group_by(Colony_ID, Temp_treatment) %>%
+  mutate(Treat_gray_value_col = mean(Mean_gray_value)) %>%
+  ungroup() %>%
+  group_by(Colony_ID) %>%
+  mutate(Delta_gray_value_col = Mean_gray_value - Treat_gray_value_col[Temp_treatment == 'Ambient'])
+
+Bleach.df5 <- Bleach.df4 %>%
+  filter(Temp_treatment == 'Elevated')
+
+Bleach.df6 <- Bleach.df4 %>%
+  filter(Cprol_abundance != 'Present') %>%
+  filter(Temp_treatment == 'Elevated')
+
+Bleach.df6$Cprol_abundance <- factor(Bleach.df6$Cprol_abundance, levels = c("Absent", "Present", "Dominant"))
+```
+
+# Test for significant differences between photosymbiont communities and coral host
+```{r}
+#Check anova assumptions (QQplots to check for normal distribution)
+aov.MGV_col <- aov(Delta_gray_value_col ~ Colony_ID, data = Bleach.df5)
+qqnorm(aov.MGV_col$residuals) 
+qqline(aov.MGV_col$residuals)
+
+aov.MGV_sym <- aov(Delta_gray_value_cprol ~ Cprol_abund_strain, data = Bleach.df6)
+qqnorm(aov.MGV_sym$residuals) 
+qqline(aov.MGV_sym$residuals)
+
+#Check for significant differences between experimental evolution treatments (using Tukey’s HSD)
+tukey_hsd.MGV_col <- aov(Delta_gray_value_col ~ Colony_ID, data = Bleach.df5) %>%
+  tukey_hsd() %>%
+  filter(p.adj < 0.05)
+
+tukey_hsd.MGV_sym <- aov(Delta_gray_value_cprol ~ Cprol_abund_strain, data = Bleach.df6) %>%
+  tukey_hsd()
+```
+
+# Plots of bleaching levels - colony
+```{r}
+Bleach_col.plot <- Bleach.df4 %>%
+  ggplot() +
+  geom_boxplot(aes(x = Colony_ID, y = Mean_gray_value, fill = Temp_treatment)) +
+  scale_colour_manual('Temperature treatment', values = c('#2171B5', '#CB181D')) +
+  scale_fill_manual('Temperature treatment', values = c('#2171B5', '#CB181D')) +
+  scale_y_continuous(expression(bold(Bleaching~level~(MGV)))) +
+  scale_x_discrete(expression(bold(Coral~colony))) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.border = element_blank(),
+        legend.title = element_text(size = 14, colour = "black", face = "bold"),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.position = 'top',
+        plot.tag = element_text(size = 14, face = "bold"),
+        strip.text.y = element_text(size = 14, face = "bold"),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = "bold"),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = "bold"), 
+        axis.text.y = element_text(size = 12, colour = "black"))
+Bleach_col.plot
+
+Delta_bleach_col.plot <- Bleach.df4 %>%
+  filter(Temp_treatment == 'Elevated') %>%
+  ggplot() +
+  geom_boxplot(aes(x = Colony_ID, y = Delta_gray_value_col), fill = 'grey') +
+  stat_pvalue_manual(tukey_hsd.MGV_col, label = "p.adj.signif", y.position = c(77.5, 72.5), tip.length = 0.01) +
+  scale_y_continuous(expression(bold(Delta~MGV)), limits = c(0, 80)) +
+  scale_x_discrete('Coral genotype') +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.border = element_blank(),
+        legend.title = element_text(size = 14, colour = "black", face = "bold"),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.position = 'top',
+        plot.tag = element_text(size = 14, face = "bold"),
+        strip.text.y = element_text(size = 14, face = "bold"),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = "bold"),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = "bold"), 
+        axis.text.y = element_text(size = 12, colour = "black"))
+Delta_bleach_col.plot
+
+Fig.1C <- cowplot::plot_grid(Bleach_col.plot,
+                             Delta_bleach_col.plot,
+                             labels = c("C", ""),
+                             ncol = 2, align = "v",
+                             axis = "b",
+                             rel_widths = c(1, 0.5))
+Fig.1C
+```
+
+# Plots of bleaching levels - photosymbionts
+```{r}
+Bleach_sym.plot <- Bleach.df4 %>%
+  filter(Cprol_abundance != 'Present' & Cprol_abund_strain != 'Absent_WT10') %>%
+  ggplot() +
+  geom_boxplot(aes(x = Cprol_abund_strain, y = Mean_gray_value, fill = Temp_treatment)) +
+  scale_colour_manual('Temperature treatment', values = c('#2171B5', '#CB181D')) +
+  scale_fill_manual('Temperature treatment', values = c('#2171B5', '#CB181D')) +
+  scale_y_continuous(expression(bold(Bleaching~level~(MGV)))) +
+  scale_x_discrete(expression(bold(Photosymbiont~strain)), labels = c('C21', 'SS', 'WT10')) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.border = element_blank(),
+        legend.title = element_text(size = 14, colour = "black", face = "bold"),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.position = 'top',
+        plot.tag = element_text(size = 14, face = "bold"),
+        strip.text.y = element_text(size = 14, face = "bold"),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = "bold"),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = "bold"), 
+        axis.text.y = element_text(size = 12, colour = "black"))
+Bleach_sym.plot
+
+Delta_bleach_sym.plot <- Bleach.df4 %>%
+  filter(Cprol_abundance != 'Present' & Temp_treatment == 'Elevated') %>%
+  ggplot() +
+  geom_boxplot(aes(x = Cprol_abund_strain, y = Delta_gray_value_col), fill = 'grey') +
+  stat_pvalue_manual(tukey_hsd.MGV_sym, label = "p.adj.signif", y.position = c(65, 55, 65), tip.length = 0.01) +
+  scale_y_continuous(expression(bold(Delta~MGV)), limits = c(0, 80)) +
+  scale_x_discrete('Photosymbiont strain', labels = c('C21', 'SS', 'WT10')) +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.border = element_blank(),
+        legend.title = element_text(size = 14, colour = "black", face = "bold"),
+        legend.text = element_text(size = 12, colour = "black"),
+        legend.position = 'top',
+        plot.tag = element_text(size = 14, face = "bold"),
+        strip.text.y = element_text(size = 14, face = "bold"),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(size = 14, colour = "black", face = "bold"),
+        axis.text.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 14, colour = "black", face = "bold"), 
+        axis.text.y = element_text(size = 12, colour = "black"))
+Delta_bleach_sym.plot
+
+Fig.1D <- cowplot::plot_grid(Bleach_sym.plot,
+                             Delta_bleach_sym.plot,
+                             labels = c("D", ""),
+                             ncol = 2, align = "v",
+                             axis = "b",
+                             rel_widths = c(1, 0.5))
+Fig.1D
+```
+
+# Combine plots
+```{r}
+Fig.1CD <- ggarrange(Fig.1C,
+                     Fig.1D,
+                     nrow = 2,
+                     labels = c("", ""),
+                     heights = c(1, 1),
+                     widths = c(1, 1))
+Fig.1CD
+```
+
+# Save the graphs
+```{r}
+ggsave(plot = Fig.1CD, "Fig. 1CD.pdf",
+       path = "./",
+       width = 10,
+       height = 7.5,
+       units = 'in',
+       dpi = 300)
+```
